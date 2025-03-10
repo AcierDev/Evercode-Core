@@ -87,7 +87,7 @@ class NetworkComm {
   void processIncomingMessage(const char* topic, byte* payload,
                               unsigned int length);
   void sendMessage(const char* targetBoard, uint8_t messageType,
-                   const JsonDocument& doc);
+                   const JsonObject& doc);
 
   // Subscription management
   struct Subscription {

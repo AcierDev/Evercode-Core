@@ -117,68 +117,76 @@ void NetworkComm::processIncomingMessage(const char* topic, byte* payload,
   memcpy(message, payload, length);
   message[length] = '\0';
 
-  // Parse JSON payload
-  JsonDocument doc;
+  // Calculate an appropriate buffer size based on the message length
+  // For JSON, we typically need 1.5x the raw message size plus some overhead
+  const size_t capacity = length * 1.5 + 64;
+  DynamicJsonDocument doc(capacity);
+
   DeserializationError error = deserializeJson(doc, message);
 
-  if (!error) {
-    // Process based on topic
-    if (strncmp(topic, DISCOVERY_TOPIC, strlen(DISCOVERY_TOPIC)) == 0) {
-      // Handle discovery message
-    } else if (strncmp(topic, PIN_TOPIC, strlen(PIN_TOPIC)) == 0) {
-      // Handle pin control/subscription
-      const char* sender = doc["sender"];
-      uint8_t pin = doc["pin"];
-      uint8_t value = doc["value"];
-      uint8_t msgType = doc["type"];
+  if (error) {
+    // Handle JSON parsing error
+    Serial.print(F("JSON parsing failed: "));
+    Serial.println(error.c_str());
+    delete[] message;
+    return;
+  }
 
-      // Find matching subscriptions
-      for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
-        if (_subscriptions[i].active &&
-            _subscriptions[i].type == MSG_TYPE_PIN_SUBSCRIBE &&
-            strcmp(_subscriptions[i].targetBoard, sender) == 0 &&
-            _subscriptions[i].pin == pin) {
-          PinChangeCallback callback =
-              (PinChangeCallback)_subscriptions[i].callback;
-          if (callback) {
-            callback(sender, pin, value);
-          }
+  // Process based on topic
+  if (strncmp(topic, DISCOVERY_TOPIC, strlen(DISCOVERY_TOPIC)) == 0) {
+    // Handle discovery message
+  } else if (strncmp(topic, PIN_TOPIC, strlen(PIN_TOPIC)) == 0) {
+    // Handle pin control/subscription
+    const char* sender = doc["sender"];
+    uint8_t pin = doc["pin"];
+    uint8_t value = doc["value"];
+    uint8_t msgType = doc["type"];
+
+    // Find matching subscriptions
+    for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
+      if (_subscriptions[i].active &&
+          _subscriptions[i].type == MSG_TYPE_PIN_SUBSCRIBE &&
+          strcmp(_subscriptions[i].targetBoard, sender) == 0 &&
+          _subscriptions[i].pin == pin) {
+        PinChangeCallback callback =
+            (PinChangeCallback)_subscriptions[i].callback;
+        if (callback) {
+          callback(sender, pin, value);
         }
       }
-    } else if (strncmp(topic, MESSAGE_TOPIC, strlen(MESSAGE_TOPIC)) == 0) {
-      // Handle pub/sub messages
-      const char* sender = doc["sender"];
-      const char* msgTopic = doc["topic"];
-      const char* msgContent = doc["message"];
+    }
+  } else if (strncmp(topic, MESSAGE_TOPIC, strlen(MESSAGE_TOPIC)) == 0) {
+    // Handle pub/sub messages
+    const char* sender = doc["sender"];
+    const char* msgTopic = doc["topic"];
+    const char* msgContent = doc["message"];
 
-      // Find matching subscriptions
-      for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
-        if (_subscriptions[i].active &&
-            _subscriptions[i].type == MSG_TYPE_MESSAGE &&
-            strcmp(_subscriptions[i].topic, msgTopic) == 0) {
-          MessageCallback callback =
-              (MessageCallback)_subscriptions[i].callback;
-          if (callback) {
-            callback(sender, msgTopic, msgContent);
-          }
+    // Find matching subscriptions
+    for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
+      if (_subscriptions[i].active &&
+          _subscriptions[i].type == MSG_TYPE_MESSAGE &&
+          strcmp(_subscriptions[i].topic, msgTopic) == 0) {
+        MessageCallback callback = (MessageCallback)_subscriptions[i].callback;
+        if (callback) {
+          callback(sender, msgTopic, msgContent);
         }
       }
-    } else if (strncmp(topic, SERIAL_TOPIC, strlen(SERIAL_TOPIC)) == 0) {
-      // Handle serial data
-      const char* sender = doc["sender"];
-      const char* data = doc["data"];
+    }
+  } else if (strncmp(topic, SERIAL_TOPIC, strlen(SERIAL_TOPIC)) == 0) {
+    // Handle serial data
+    const char* sender = doc["sender"];
+    const char* data = doc["data"];
 
-      if (_serialDataCallback) {
-        _serialDataCallback(sender, data);
-      }
-    } else if (strncmp(topic, DIRECT_TOPIC, strlen(DIRECT_TOPIC)) == 0) {
-      // Handle direct messages
-      const char* sender = doc["sender"];
-      const char* msgContent = doc["message"];
+    if (_serialDataCallback) {
+      _serialDataCallback(sender, data);
+    }
+  } else if (strncmp(topic, DIRECT_TOPIC, strlen(DIRECT_TOPIC)) == 0) {
+    // Handle direct messages
+    const char* sender = doc["sender"];
+    const char* msgContent = doc["message"];
 
-      if (_directMessageCallback) {
-        _directMessageCallback(sender, NULL, msgContent);
-      }
+    if (_directMessageCallback) {
+      _directMessageCallback(sender, NULL, msgContent);
     }
   }
 
@@ -187,12 +195,14 @@ void NetworkComm::processIncomingMessage(const char* topic, byte* payload,
 
 // Send a message to a specific board
 void NetworkComm::sendMessage(const char* targetBoard, uint8_t messageType,
-                              const JsonDocument& doc) {
+                              const JsonObject& doc) {
   if (!_isConnected) return;
 
-  // Create a new document and copy contents instead of copying the JsonDocument
-  JsonDocument outDoc;
-  outDoc.set(doc.as<JsonObjectConst>());  // Copy contents from original doc
+  // Reserve memory for the outgoing document (original doc + sender and type
+  // fields) Plus extra margin for additional fields
+  const size_t capacity = JSON_OBJECT_SIZE(2) + measureJson(doc) + 30;
+  DynamicJsonDocument outDoc(capacity);
+  outDoc.set(doc);  // Copy contents from original doc
 
   // Add sender information
   outDoc["sender"] = _boardId;
@@ -263,11 +273,13 @@ bool NetworkComm::setPinValue(const char* targetBoard, uint8_t pin,
                               uint8_t value) {
   if (!_isConnected) return false;
 
-  JsonDocument doc;
+  // For a simple pin value object with pin and value fields
+  const size_t capacity = JSON_OBJECT_SIZE(2);
+  DynamicJsonDocument doc(capacity);
   doc["pin"] = pin;
   doc["value"] = value;
 
-  sendMessage(targetBoard, MSG_TYPE_PIN_CONTROL, doc);
+  sendMessage(targetBoard, MSG_TYPE_PIN_CONTROL, doc.as<JsonObject>());
   return true;
 }
 
@@ -309,11 +321,12 @@ bool NetworkComm::subscribeToPinChange(const char* targetBoard, uint8_t pin,
   topic += targetBoard;
   _mqttClient.subscribe(topic.c_str());
 
-  // Send subscription request
-  JsonDocument doc;
+  // For a simple pin object with just one field
+  const size_t capacity = JSON_OBJECT_SIZE(1);
+  DynamicJsonDocument doc(capacity);
   doc["pin"] = pin;
 
-  sendMessage(targetBoard, MSG_TYPE_PIN_SUBSCRIBE, doc);
+  sendMessage(targetBoard, MSG_TYPE_PIN_SUBSCRIBE, doc.as<JsonObject>());
   return true;
 }
 
@@ -340,11 +353,14 @@ bool NetworkComm::unsubscribeFromPinChange(const char* targetBoard,
 bool NetworkComm::publish(const char* topic, const char* message) {
   if (!_isConnected) return false;
 
-  JsonDocument doc;
+  // Calculate capacity for topic and message fields
+  const size_t capacity =
+      JSON_OBJECT_SIZE(2) + strlen(topic) + strlen(message) + 20;
+  DynamicJsonDocument doc(capacity);
   doc["topic"] = topic;
   doc["message"] = message;
 
-  sendMessage(NULL, MSG_TYPE_MESSAGE, doc);
+  sendMessage(NULL, MSG_TYPE_MESSAGE, doc.as<JsonObject>());
   return true;
 }
 
@@ -406,10 +422,12 @@ bool NetworkComm::unsubscribe(const char* topic) {
 bool NetworkComm::publishSerialData(const char* data) {
   if (!_isConnected) return false;
 
-  JsonDocument doc;
+  // Calculate capacity based on data size
+  const size_t capacity = JSON_OBJECT_SIZE(1) + strlen(data) + 10;
+  DynamicJsonDocument doc(capacity);
   doc["data"] = data;
 
-  sendMessage(NULL, MSG_TYPE_SERIAL_DATA, doc);
+  sendMessage(NULL, MSG_TYPE_SERIAL_DATA, doc.as<JsonObject>());
   return true;
 }
 
@@ -442,10 +460,16 @@ bool NetworkComm::sendDirectMessage(const char* targetBoard,
                                     const char* message) {
   if (!_isConnected) return false;
 
-  JsonDocument doc;
+  // Calculate the capacity needed for the message
+  // JSON_OBJECT_SIZE(2) accounts for the {"message": "value", "sender":
+  // "value"} structure
+  const size_t capacity =
+      JSON_OBJECT_SIZE(2) + strlen(message) + strlen(_boardId) + 20;
+  DynamicJsonDocument doc(capacity);
+
   doc["message"] = message;
 
-  sendMessage(targetBoard, MSG_TYPE_DIRECT_MESSAGE, doc);
+  sendMessage(targetBoard, MSG_TYPE_DIRECT_MESSAGE, doc.as<JsonObject>());
   return true;
 }
 
