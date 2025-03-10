@@ -118,7 +118,7 @@ void NetworkComm::processIncomingMessage(const char* topic, byte* payload,
   message[length] = '\0';
 
   // Parse JSON payload
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
   DeserializationError error = deserializeJson(doc, message);
 
   if (!error) {
@@ -190,8 +190,11 @@ void NetworkComm::sendMessage(const char* targetBoard, uint8_t messageType,
                               const JsonDocument& doc) {
   if (!_isConnected) return;
 
+  // Create a new document and copy contents instead of copying the JsonDocument
+  JsonDocument outDoc;
+  outDoc.set(doc.as<JsonObjectConst>());  // Copy contents from original doc
+
   // Add sender information
-  JsonDocument outDoc = doc;
   outDoc["sender"] = _boardId;
   outDoc["type"] = messageType;
 
@@ -260,7 +263,7 @@ bool NetworkComm::setPinValue(const char* targetBoard, uint8_t pin,
                               uint8_t value) {
   if (!_isConnected) return false;
 
-  StaticJsonDocument<128> doc;
+  JsonDocument doc;
   doc["pin"] = pin;
   doc["value"] = value;
 
@@ -307,7 +310,7 @@ bool NetworkComm::subscribeToPinChange(const char* targetBoard, uint8_t pin,
   _mqttClient.subscribe(topic.c_str());
 
   // Send subscription request
-  StaticJsonDocument<128> doc;
+  JsonDocument doc;
   doc["pin"] = pin;
 
   sendMessage(targetBoard, MSG_TYPE_PIN_SUBSCRIBE, doc);
@@ -337,7 +340,7 @@ bool NetworkComm::unsubscribeFromPinChange(const char* targetBoard,
 bool NetworkComm::publish(const char* topic, const char* message) {
   if (!_isConnected) return false;
 
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
   doc["topic"] = topic;
   doc["message"] = message;
 
@@ -403,7 +406,7 @@ bool NetworkComm::unsubscribe(const char* topic) {
 bool NetworkComm::publishSerialData(const char* data) {
   if (!_isConnected) return false;
 
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
   doc["data"] = data;
 
   sendMessage(NULL, MSG_TYPE_SERIAL_DATA, doc);
@@ -439,7 +442,7 @@ bool NetworkComm::sendDirectMessage(const char* targetBoard,
                                     const char* message) {
   if (!_isConnected) return false;
 
-  StaticJsonDocument<256> doc;
+  JsonDocument doc;
   doc["message"] = message;
 
   sendMessage(targetBoard, MSG_TYPE_DIRECT_MESSAGE, doc);
