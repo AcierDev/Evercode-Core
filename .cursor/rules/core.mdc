@@ -1,0 +1,9 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+
+# Your rule content
+
+This project is a platformio library designs for cross-board communication. The most important thing is that all code is hyper-optimized to be as lightweight as possible. Code organization is very important. Code should be professionally written and follow best coding practices. The codebase should be compatible with esp32. 
