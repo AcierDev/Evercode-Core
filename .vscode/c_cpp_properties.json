@@ -10,7 +10,6 @@
             "includePath": [
                 "/Users/steelebenjamin/Documents/Everwood/Code/Evercode-Core/include",
                 "/Users/steelebenjamin/Documents/Everwood/Code/Evercode-Core/src",
-                "/Users/steelebenjamin/Documents/Everwood/Code/Evercode-Core/lib/NetworkComm",
                 "/Users/steelebenjamin/.platformio/packages/framework-arduinoespressif32/libraries/ESPmDNS/src",
                 "/Users/steelebenjamin/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src",
                 "/Users/steelebenjamin/Documents/Everwood/Code/Evercode-Core/.pio/libdeps/esp32dev/ArduinoJson/src",
@@ -249,7 +248,6 @@
                 "path": [
                     "/Users/steelebenjamin/Documents/Everwood/Code/Evercode-Core/include",
                     "/Users/steelebenjamin/Documents/Everwood/Code/Evercode-Core/src",
-                    "/Users/steelebenjamin/Documents/Everwood/Code/Evercode-Core/lib/NetworkComm",
                     "/Users/steelebenjamin/.platformio/packages/framework-arduinoespressif32/libraries/ESPmDNS/src",
                     "/Users/steelebenjamin/.platformio/packages/framework-arduinoespressif32/libraries/WiFi/src",
                     "/Users/steelebenjamin/Documents/Everwood/Code/Evercode-Core/.pio/libdeps/esp32dev/ArduinoJson/src",
