@@ -25,6 +25,8 @@
 #define MSG_TYPE_DISCOVERY 7
 #define MSG_TYPE_DISCOVERY_RESPONSE 8
 #define MSG_TYPE_ACKNOWLEDGEMENT 9
+#define MSG_TYPE_PIN_CONTROL_CONFIRM 10
+#define MSG_TYPE_PIN_CONTROL_RESPONSE 11
 
 // Maximum number of subscriptions
 #define MAX_SUBSCRIPTIONS 20
@@ -33,6 +35,10 @@
 // Maximum ESP-NOW data size
 #define MAX_ESP_NOW_DATA_SIZE 250
 
+// Timeouts
+#define ACK_TIMEOUT 5000                  // 5 seconds
+#define PIN_CONTROL_CONFIRM_TIMEOUT 5000  // 5 seconds
+
 // Callback function types
 typedef void (*MessageCallback)(const char* sender, const char* topic,
                                 const char* message);
@@ -40,6 +46,8 @@ typedef void (*PinChangeCallback)(const char* sender, uint8_t pin,
                                   uint8_t value);
 typedef void (*SerialDataCallback)(const char* sender, const char* data);
 typedef void (*DiscoveryCallback)(const char* boardId);
+typedef void (*PinControlConfirmCallback)(const char* sender, uint8_t pin,
+                                          uint8_t value, bool success);
 
 class NetworkComm {
  public:
@@ -66,6 +74,10 @@ class NetworkComm {
 
   // Pin control
   bool setPinValue(const char* targetBoard, uint8_t pin, uint8_t value);
+  bool setPinValueWithConfirmation(const char* targetBoard, uint8_t pin,
+                                   uint8_t value,
+                                   PinControlConfirmCallback callback);
+  bool clearPinControlConfirmCallback();
   uint8_t getPinValue(const char* targetBoard, uint8_t pin);
 
   // Pin subscription
@@ -106,6 +118,7 @@ class NetworkComm {
     bool acknowledged;
     uint32_t sentTime;
     bool active;
+    uint8_t messageType;  // Store the message type
   };
 
   MessageTrack _trackedMessages[MAX_TRACKED_MESSAGES];
@@ -157,6 +170,7 @@ class NetworkComm {
   MessageCallback _directMessageCallback;
   SerialDataCallback _serialDataCallback;
   DiscoveryCallback _discoveryCallback;
+  PinControlConfirmCallback _pinControlConfirmCallback;
 
   // Internal helper functions
   uint32_t _lastDiscoveryBroadcast;

@@ -36,6 +36,8 @@ NetworkComm::NetworkComm() {
   _directMessageCallback = NULL;
   _serialDataCallback = NULL;
   _discoveryCallback = NULL;  // Initialize discovery callback
+  _pinControlConfirmCallback =
+      NULL;  // Initialize pin control confirmation callback
   _lastDiscoveryBroadcast = 0;
   _acknowledgementsEnabled = false;
   _trackedMessageCount = 0;
@@ -181,9 +183,7 @@ void NetworkComm::update() {
 
   // Process message acknowledgements if enabled
   if (_acknowledgementsEnabled) {
-    // Check for message timeouts (5 second timeout)
-    const uint32_t ACK_TIMEOUT = 5000;  // 5 seconds
-
+    // Check for message timeouts
     for (int i = 0; i < MAX_TRACKED_MESSAGES; i++) {
       if (_trackedMessages[i].active) {
         // Check if message timed out
@@ -194,6 +194,15 @@ void NetworkComm::update() {
                   _trackedMessages[i].messageId,
                   _trackedMessages[i].targetBoard);
           debugLog(debugMsg);
+
+          // If this was a pin control confirmation message, call the callback
+          // with failure
+          if (_pinControlConfirmCallback &&
+              _trackedMessages[i].messageType == MSG_TYPE_PIN_CONTROL_CONFIRM) {
+            // Call the callback with failure
+            _pinControlConfirmCallback(_trackedMessages[i].targetBoard, 0, 0,
+                                       false);
+          }
 
           // Clean up this slot
           _trackedMessages[i].active = false;
@@ -213,7 +222,9 @@ void NetworkComm::update() {
 void NetworkComm::broadcastPresence() {
   if (!_isConnected) return;
 
-  Serial.println("[NetworkComm] Broadcasting presence");
+  if (isDebugLoggingEnabled()) {
+    Serial.println("[NetworkComm] Broadcasting presence");
+  }
 
   // Send directly with broadcast address for maximum compatibility
   uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -407,6 +418,81 @@ void NetworkComm::processIncomingMessage(const uint8_t* mac,
       }
       break;
 
+    case MSG_TYPE_PIN_CONTROL_CONFIRM:
+      if (sender && doc.containsKey("pin") && doc.containsKey("value") &&
+          doc.containsKey("messageId")) {
+        uint8_t pin = doc["pin"];
+        uint8_t value = doc["value"];
+        const char* messageId = doc["messageId"];
+
+        // Debug logging
+        if (_debugLoggingEnabled) {
+          char debugMsg[100];
+          sprintf(debugMsg,
+                  "Received pin control confirmation request from %s: pin=%d, "
+                  "value=%d",
+                  sender, pin, value);
+          debugLog(debugMsg);
+        }
+
+        // Apply the pin value
+        bool success = false;
+        if (pin < NUM_DIGITAL_PINS) {
+          pinMode(pin, OUTPUT);
+          digitalWrite(pin, value);
+          success = true;
+        }
+
+        // Send confirmation response
+        DynamicJsonDocument responseDoc(128);
+        responseDoc["pin"] = pin;
+        responseDoc["value"] = value;
+        responseDoc["success"] = success;
+        responseDoc["messageId"] = messageId;
+
+        sendMessage(sender, MSG_TYPE_PIN_CONTROL_RESPONSE,
+                    responseDoc.as<JsonObject>());
+      }
+      break;
+
+    case MSG_TYPE_PIN_CONTROL_RESPONSE:
+      if (sender && doc.containsKey("pin") && doc.containsKey("value") &&
+          doc.containsKey("success") && doc.containsKey("messageId")) {
+        uint8_t pin = doc["pin"];
+        uint8_t value = doc["value"];
+        bool success = doc["success"];
+        const char* messageId = doc["messageId"];
+
+        // Debug logging
+        if (_debugLoggingEnabled) {
+          char debugMsg[100];
+          sprintf(debugMsg,
+                  "Received pin control confirmation response from %s: pin=%d, "
+                  "value=%d, success=%d",
+                  sender, pin, value, success);
+          debugLog(debugMsg);
+        }
+
+        // Find the tracked message
+        for (int i = 0; i < MAX_TRACKED_MESSAGES; i++) {
+          if (_trackedMessages[i].active &&
+              strcmp(_trackedMessages[i].messageId, messageId) == 0) {
+            // Mark as acknowledged
+            _trackedMessages[i].acknowledged = true;
+
+            // Call the callback if set
+            if (_pinControlConfirmCallback) {
+              _pinControlConfirmCallback(sender, pin, value, success);
+            }
+
+            // Clear the tracked message
+            _trackedMessages[i].active = false;
+            break;
+          }
+        }
+      }
+      break;
+
     case MSG_TYPE_PIN_CONTROL:
     case MSG_TYPE_PIN_PUBLISH:
       if (sender && doc.containsKey("pin") && doc.containsKey("value")) {
@@ -532,6 +618,9 @@ bool NetworkComm::sendMessage(const char* targetBoard, uint8_t messageType,
         _trackedMessages[i].acknowledged = false;
         _trackedMessages[i].sentTime = millis();
         _trackedMessages[i].active = true;
+        _trackedMessages[i].messageType = messageType;
+
+        _trackedMessageCount++;
         break;
       }
     }
@@ -640,6 +729,52 @@ bool NetworkComm::setPinValue(const char* targetBoard, uint8_t pin,
   doc["value"] = value;
 
   return sendMessage(targetBoard, MSG_TYPE_PIN_CONTROL, doc.as<JsonObject>());
+}
+
+// Set pin value on remote board with confirmation
+bool NetworkComm::setPinValueWithConfirmation(
+    const char* targetBoard, uint8_t pin, uint8_t value,
+    PinControlConfirmCallback callback) {
+  if (!_isConnected) return false;
+
+  char debugMsg[100];
+  sprintf(debugMsg, "board %s, pin %d, value %d (with confirmation)",
+          targetBoard, pin, value);
+  debugLog("Setting pin value", debugMsg);
+
+  // Store the callback for later use
+  _pinControlConfirmCallback = callback;
+
+  DynamicJsonDocument doc(64);
+  doc["pin"] = pin;
+  doc["value"] = value;
+
+  // Generate a message ID for tracking
+  char messageId[37];
+  generateMessageId(messageId);
+  doc["messageId"] = messageId;
+
+  // Track this message for confirmation
+  for (int i = 0; i < MAX_TRACKED_MESSAGES; i++) {
+    if (!_trackedMessages[i].active) {
+      strcpy(_trackedMessages[i].messageId, messageId);
+      strcpy(_trackedMessages[i].targetBoard, targetBoard);
+      _trackedMessages[i].acknowledged = false;
+      _trackedMessages[i].sentTime = millis();
+      _trackedMessages[i].active = true;
+      break;
+    }
+  }
+
+  return sendMessage(targetBoard, MSG_TYPE_PIN_CONTROL_CONFIRM,
+                     doc.as<JsonObject>());
+}
+
+// Clear the pin control confirmation callback
+bool NetworkComm::clearPinControlConfirmCallback() {
+  debugLog("Clearing pin control confirmation callback");
+  _pinControlConfirmCallback = NULL;
+  return true;
 }
 
 // Get pin value from remote board (this would be async in reality)
