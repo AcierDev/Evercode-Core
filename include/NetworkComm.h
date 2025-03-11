@@ -5,6 +5,13 @@
  *
  * This library enables communication between ESP32 boards using
  * ESP-NOW for direct peer-to-peer data exchange.
+ *
+ * IMPORTANT USAGE NOTES:
+ * - When using pin control functionality, you must still configure pin modes on
+ * the target board
+ * - Example: For remote LED control, use pinMode(LED_PIN, OUTPUT) on the board
+ * with the LED
+ * - The NetworkComm library handles communication but not pin configuration
  */
 
 #ifndef NetworkComm_h
@@ -54,53 +61,127 @@ class NetworkComm {
   // Constructor
   NetworkComm();
 
-  // Initialization
+  // ==================== Initialization ====================
   bool begin(const char* ssid, const char* password, const char* boardId);
 
   // Main loop function - must be called in loop()
   void update();
 
-  // Board discovery
+  // ==================== Board Discovery & Network Status ====================
   bool isConnected();
   bool isBoardAvailable(const char* boardId);
   int getAvailableBoardsCount();
   String getAvailableBoardName(int index);
+  bool onBoardDiscovered(DiscoveryCallback callback);
 
-  // Debug features
+  // ==================== Debug & Diagnostic Features ====================
   bool enableMessageAcknowledgements(bool enable);
   bool isAcknowledgementsEnabled();
   bool enableDebugLogging(bool enable);
   bool isDebugLoggingEnabled();
 
-  // Pin control
-  bool setPinValue(const char* targetBoard, uint8_t pin, uint8_t value);
+  // ==================== Remote Pin Control (Controller Side)
+  // ====================
+  bool controlRemotePin(const char* targetBoardId, uint8_t pin, uint8_t value);
+  bool controlRemotePinWithConfirmation(const char* targetBoardId, uint8_t pin,
+                                        uint8_t value,
+                                        PinControlConfirmCallback callback);
+  bool clearRemotePinConfirmCallback();
+  uint8_t readRemotePin(const char* targetBoardId, uint8_t pin);
+
+  // ==================== Remote Pin Control (Responder Side)
+  // ====================
+  bool acceptPinControlFrom(const char* controllerBoardId, uint8_t pin,
+                            PinChangeCallback callback);
+  bool stopAcceptingPinControlFrom(const char* controllerBoardId, uint8_t pin);
+
+  // ==================== Pin State Broadcasting ====================
+  bool broadcastPinState(uint8_t pin, uint8_t value);
+  bool listenForPinStateFrom(const char* broadcasterBoardId, uint8_t pin,
+                             PinChangeCallback callback);
+  bool stopListeningForPinStateFrom(const char* broadcasterBoardId,
+                                    uint8_t pin);
+
+  // ==================== Topic-based Messaging ====================
+  bool publishTopic(const char* topic, const char* message);
+  bool subscribeTopic(const char* topic, MessageCallback callback);
+  bool unsubscribeTopic(const char* topic);
+
+  // ==================== Serial Data Forwarding ====================
+  bool forwardSerialData(const char* data);
+  bool receiveSerialData(SerialDataCallback callback);
+  bool stopReceivingSerialData();
+
+  // ==================== Direct Messaging ====================
+  bool sendMessageToBoardId(const char* targetBoardId, const char* message);
+  bool receiveMessagesFromBoards(MessageCallback callback);
+
+  // ==================== Deprecated API (for backward compatibility)
+  // ==================== These methods are kept for backward compatibility but
+  // will be removed in future versions
+
+  // Pin control (deprecated)
+  bool setPinValue(const char* targetBoard, uint8_t pin, uint8_t value) {
+    return controlRemotePin(targetBoard, pin, value);
+  }
+
   bool setPinValueWithConfirmation(const char* targetBoard, uint8_t pin,
                                    uint8_t value,
-                                   PinControlConfirmCallback callback);
-  bool clearPinControlConfirmCallback();
-  uint8_t getPinValue(const char* targetBoard, uint8_t pin);
+                                   PinControlConfirmCallback callback) {
+    return controlRemotePinWithConfirmation(targetBoard, pin, value, callback);
+  }
 
-  // Pin subscription
+  bool clearPinControlConfirmCallback() {
+    return clearRemotePinConfirmCallback();
+  }
+
+  uint8_t getPinValue(const char* targetBoard, uint8_t pin) {
+    return readRemotePin(targetBoard, pin);
+  }
+
+  // Pin subscription (deprecated)
   bool subscribeToPinChange(const char* targetBoard, uint8_t pin,
-                            PinChangeCallback callback);
-  bool unsubscribeFromPinChange(const char* targetBoard, uint8_t pin);
+                            PinChangeCallback callback) {
+    return acceptPinControlFrom(targetBoard, pin, callback);
+  }
 
-  // Message pub/sub
-  bool publish(const char* topic, const char* message);
-  bool subscribe(const char* topic, MessageCallback callback);
-  bool unsubscribe(const char* topic);
+  bool unsubscribeFromPinChange(const char* targetBoard, uint8_t pin) {
+    return stopAcceptingPinControlFrom(targetBoard, pin);
+  }
 
-  // Serial data pub/sub
-  bool publishSerialData(const char* data);
-  bool subscribeToSerialData(SerialDataCallback callback);
-  bool unsubscribeFromSerialData();
+  // Message pub/sub (deprecated)
+  bool publish(const char* topic, const char* message) {
+    return publishTopic(topic, message);
+  }
 
-  // Direct messaging
-  bool sendDirectMessage(const char* targetBoard, const char* message);
-  bool setDirectMessageCallback(MessageCallback callback);
+  bool subscribe(const char* topic, MessageCallback callback) {
+    return subscribeTopic(topic, callback);
+  }
 
-  // Board Discovery
-  bool setDiscoveryCallback(DiscoveryCallback callback);
+  bool unsubscribe(const char* topic) { return unsubscribeTopic(topic); }
+
+  // Serial data pub/sub (deprecated)
+  bool publishSerialData(const char* data) { return forwardSerialData(data); }
+
+  bool subscribeToSerialData(SerialDataCallback callback) {
+    return receiveSerialData(callback);
+  }
+
+  bool unsubscribeFromSerialData() { return stopReceivingSerialData(); }
+
+  // Direct messaging (deprecated)
+  bool sendDirectMessage(const char* targetBoard, const char* message) {
+    return sendMessageToBoardId(targetBoard, message);
+  }
+
+  bool setDirectMessageCallback(MessageCallback callback) {
+    return receiveMessagesFromBoards(callback);
+  }
+
+  // Board Discovery (deprecated)
+  bool setDiscoveryCallback(DiscoveryCallback callback) {
+    return onBoardDiscovered(callback);
+  }
 
  private:
   // Board identification

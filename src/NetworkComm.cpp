@@ -682,22 +682,6 @@ bool NetworkComm::broadcastMessage(uint8_t messageType, const JsonObject& doc) {
                                   jsonStr.length() + 1);
   return (result == ESP_OK);
 }
-
-// Check if connected to network
-bool NetworkComm::isConnected() {
-  return _isConnected && (WiFi.status() == WL_CONNECTED);
-}
-
-// Check if a specific board is available
-bool NetworkComm::isBoardAvailable(const char* boardId) {
-  for (int i = 0; i < MAX_PEERS; i++) {
-    if (_peers[i].active && strcmp(_peers[i].boardId, boardId) == 0) {
-      return true;
-    }
-  }
-  return false;
-}
-
 // Get count of available boards
 int NetworkComm::getAvailableBoardsCount() { return _peerCount; }
 
@@ -715,32 +699,36 @@ String NetworkComm::getAvailableBoardName(int index) {
   return String("");
 }
 
-// Set pin value on remote board
-bool NetworkComm::setPinValue(const char* targetBoard, uint8_t pin,
-                              uint8_t value) {
+// ==================== Remote Pin Control (Controller Side)
+// ====================
+
+// Set pin value on remote board (old name: setPinValue)
+bool NetworkComm::controlRemotePin(const char* targetBoardId, uint8_t pin,
+                                   uint8_t value) {
   if (!_isConnected) return false;
 
   char debugMsg[100];
-  sprintf(debugMsg, "board %s, pin %d, value %d", targetBoard, pin, value);
-  debugLog("Setting pin value", debugMsg);
+  sprintf(debugMsg, "board %s, pin %d, value %d", targetBoardId, pin, value);
+  debugLog("Controlling remote pin", debugMsg);
 
   DynamicJsonDocument doc(64);
   doc["pin"] = pin;
   doc["value"] = value;
 
-  return sendMessage(targetBoard, MSG_TYPE_PIN_CONTROL, doc.as<JsonObject>());
+  return sendMessage(targetBoardId, MSG_TYPE_PIN_CONTROL, doc.as<JsonObject>());
 }
 
-// Set pin value on remote board with confirmation
-bool NetworkComm::setPinValueWithConfirmation(
-    const char* targetBoard, uint8_t pin, uint8_t value,
+// Set pin value on remote board with confirmation (old name:
+// setPinValueWithConfirmation)
+bool NetworkComm::controlRemotePinWithConfirmation(
+    const char* targetBoardId, uint8_t pin, uint8_t value,
     PinControlConfirmCallback callback) {
   if (!_isConnected) return false;
 
   char debugMsg[100];
   sprintf(debugMsg, "board %s, pin %d, value %d (with confirmation)",
-          targetBoard, pin, value);
-  debugLog("Setting pin value", debugMsg);
+          targetBoardId, pin, value);
+  debugLog("Controlling remote pin", debugMsg);
 
   // Store the callback for later use
   _pinControlConfirmCallback = callback;
@@ -758,7 +746,7 @@ bool NetworkComm::setPinValueWithConfirmation(
   for (int i = 0; i < MAX_TRACKED_MESSAGES; i++) {
     if (!_trackedMessages[i].active) {
       strcpy(_trackedMessages[i].messageId, messageId);
-      strcpy(_trackedMessages[i].targetBoard, targetBoard);
+      strcpy(_trackedMessages[i].targetBoard, targetBoardId);
       _trackedMessages[i].acknowledged = false;
       _trackedMessages[i].sentTime = millis();
       _trackedMessages[i].active = true;
@@ -766,37 +754,41 @@ bool NetworkComm::setPinValueWithConfirmation(
     }
   }
 
-  return sendMessage(targetBoard, MSG_TYPE_PIN_CONTROL_CONFIRM,
+  return sendMessage(targetBoardId, MSG_TYPE_PIN_CONTROL_CONFIRM,
                      doc.as<JsonObject>());
 }
 
-// Clear the pin control confirmation callback
-bool NetworkComm::clearPinControlConfirmCallback() {
+// Clear the pin control confirmation callback (old name:
+// clearPinControlConfirmCallback)
+bool NetworkComm::clearRemotePinConfirmCallback() {
   debugLog("Clearing pin control confirmation callback");
   _pinControlConfirmCallback = NULL;
   return true;
 }
 
-// Get pin value from remote board (this would be async in reality)
-uint8_t NetworkComm::getPinValue(const char* targetBoard, uint8_t pin) {
+// Get pin value from remote board (old name: getPinValue)
+uint8_t NetworkComm::readRemotePin(const char* targetBoardId, uint8_t pin) {
   // This would need to be implemented with a request/response pattern
 
   char debugMsg[100];
-  sprintf(debugMsg, "board %s, pin %d", targetBoard, pin);
-  debugLog("Getting pin value", debugMsg);
+  sprintf(debugMsg, "board %s, pin %d", targetBoardId, pin);
+  debugLog("Reading remote pin value", debugMsg);
 
   // For simplicity, we're returning 0
   return 0;
 }
 
-// Subscribe to pin changes on remote board
-bool NetworkComm::subscribeToPinChange(const char* targetBoard, uint8_t pin,
+// ==================== Remote Pin Control (Responder Side) ====================
+
+// Subscribe to pin changes on remote board (old name: subscribeToPinChange)
+bool NetworkComm::acceptPinControlFrom(const char* controllerBoardId,
+                                       uint8_t pin,
                                        PinChangeCallback callback) {
   if (!_isConnected) return false;
 
   char debugMsg[100];
-  sprintf(debugMsg, "to board %s, pin %d", targetBoard, pin);
-  debugLog("Subscribing to pin change", debugMsg);
+  sprintf(debugMsg, "from board %s, pin %d", controllerBoardId, pin);
+  debugLog("Accepting pin control commands", debugMsg);
 
   // Find free subscription slot
   int slot = -1;
@@ -810,7 +802,7 @@ bool NetworkComm::subscribeToPinChange(const char* targetBoard, uint8_t pin,
   if (slot == -1) return false;  // No free slots
 
   // Store subscription
-  strncpy(_subscriptions[slot].targetBoard, targetBoard,
+  strncpy(_subscriptions[slot].targetBoard, controllerBoardId,
           sizeof(_subscriptions[slot].targetBoard) - 1);
   _subscriptions[slot]
       .targetBoard[sizeof(_subscriptions[slot].targetBoard) - 1] = '\0';
@@ -823,23 +815,24 @@ bool NetworkComm::subscribeToPinChange(const char* targetBoard, uint8_t pin,
   DynamicJsonDocument doc(64);
   doc["pin"] = pin;
 
-  return sendMessage(targetBoard, MSG_TYPE_PIN_SUBSCRIBE, doc.as<JsonObject>());
+  return sendMessage(controllerBoardId, MSG_TYPE_PIN_SUBSCRIBE,
+                     doc.as<JsonObject>());
 }
 
-// Unsubscribe from pin changes
-bool NetworkComm::unsubscribeFromPinChange(const char* targetBoard,
-                                           uint8_t pin) {
+// Unsubscribe from pin changes (old name: unsubscribeFromPinChange)
+bool NetworkComm::stopAcceptingPinControlFrom(const char* controllerBoardId,
+                                              uint8_t pin) {
   if (!_isConnected) return false;
 
   char debugMsg[100];
-  sprintf(debugMsg, "from board %s, pin %d", targetBoard, pin);
-  debugLog("Unsubscribing from pin change", debugMsg);
+  sprintf(debugMsg, "from board %s, pin %d", controllerBoardId, pin);
+  debugLog("Stopping pin control acceptance", debugMsg);
 
   // Find matching subscription
   for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
     if (_subscriptions[i].active &&
         _subscriptions[i].type == MSG_TYPE_PIN_SUBSCRIBE &&
-        strcmp(_subscriptions[i].targetBoard, targetBoard) == 0 &&
+        strcmp(_subscriptions[i].targetBoard, controllerBoardId) == 0 &&
         _subscriptions[i].pin == pin) {
       _subscriptions[i].active = false;
       return true;
@@ -849,13 +842,89 @@ bool NetworkComm::unsubscribeFromPinChange(const char* targetBoard,
   return false;
 }
 
-// Publish message to topic
-bool NetworkComm::publish(const char* topic, const char* message) {
+// ==================== Pin State Broadcasting ====================
+
+// Broadcast pin state to all boards (new method)
+bool NetworkComm::broadcastPinState(uint8_t pin, uint8_t value) {
+  if (!_isConnected) return false;
+
+  char debugMsg[100];
+  sprintf(debugMsg, "Broadcasting pin %d state: %d", pin, value);
+  debugLog(debugMsg);
+
+  DynamicJsonDocument doc(64);
+  doc["pin"] = pin;
+  doc["value"] = value;
+
+  return broadcastMessage(MSG_TYPE_PIN_PUBLISH, doc.as<JsonObject>());
+}
+
+// Listen for pin state broadcasts (new method)
+bool NetworkComm::listenForPinStateFrom(const char* broadcasterBoardId,
+                                        uint8_t pin,
+                                        PinChangeCallback callback) {
+  if (!_isConnected) return false;
+
+  char debugMsg[100];
+  sprintf(debugMsg, "from board %s, pin %d", broadcasterBoardId, pin);
+  debugLog("Listening for pin state broadcasts", debugMsg);
+
+  // Find free subscription slot
+  int slot = -1;
+  for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
+    if (!_subscriptions[i].active) {
+      slot = i;
+      break;
+    }
+  }
+
+  if (slot == -1) return false;  // No free slots
+
+  // Store subscription
+  strncpy(_subscriptions[slot].targetBoard, broadcasterBoardId,
+          sizeof(_subscriptions[slot].targetBoard) - 1);
+  _subscriptions[slot]
+      .targetBoard[sizeof(_subscriptions[slot].targetBoard) - 1] = '\0';
+  _subscriptions[slot].pin = pin;
+  _subscriptions[slot].type = MSG_TYPE_PIN_PUBLISH;
+  _subscriptions[slot].callback = (void*)callback;
+  _subscriptions[slot].active = true;
+
+  return true;
+}
+
+// Stop listening for pin state broadcasts (new method)
+bool NetworkComm::stopListeningForPinStateFrom(const char* broadcasterBoardId,
+                                               uint8_t pin) {
+  if (!_isConnected) return false;
+
+  char debugMsg[100];
+  sprintf(debugMsg, "from board %s, pin %d", broadcasterBoardId, pin);
+  debugLog("Stopping pin state broadcast listening", debugMsg);
+
+  // Find matching subscription
+  for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
+    if (_subscriptions[i].active &&
+        _subscriptions[i].type == MSG_TYPE_PIN_PUBLISH &&
+        strcmp(_subscriptions[i].targetBoard, broadcasterBoardId) == 0 &&
+        _subscriptions[i].pin == pin) {
+      _subscriptions[i].active = false;
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// ==================== Topic-based Messaging ====================
+
+// Publish message to topic (old name: publish)
+bool NetworkComm::publishTopic(const char* topic, const char* message) {
   if (!_isConnected) return false;
 
   char debugMsg[100];
   sprintf(debugMsg, "topic '%s', message: %s", topic, message);
-  debugLog("Publishing message", debugMsg);
+  debugLog("Publishing to topic", debugMsg);
 
   DynamicJsonDocument doc(256);
   doc["topic"] = topic;
@@ -864,8 +933,8 @@ bool NetworkComm::publish(const char* topic, const char* message) {
   return broadcastMessage(MSG_TYPE_MESSAGE, doc.as<JsonObject>());
 }
 
-// Subscribe to topic
-bool NetworkComm::subscribe(const char* topic, MessageCallback callback) {
+// Subscribe to topic (old name: subscribe)
+bool NetworkComm::subscribeTopic(const char* topic, MessageCallback callback) {
   if (!_isConnected) return false;
 
   debugLog("Subscribing to topic", topic);
@@ -892,8 +961,8 @@ bool NetworkComm::subscribe(const char* topic, MessageCallback callback) {
   return true;
 }
 
-// Unsubscribe from topic
-bool NetworkComm::unsubscribe(const char* topic) {
+// Unsubscribe from topic (old name: unsubscribe)
+bool NetworkComm::unsubscribeTopic(const char* topic) {
   if (!_isConnected) return false;
 
   debugLog("Unsubscribing from topic", topic);
@@ -911,11 +980,13 @@ bool NetworkComm::unsubscribe(const char* topic) {
   return false;
 }
 
-// Publish serial data
-bool NetworkComm::publishSerialData(const char* data) {
+// ==================== Serial Data Forwarding ====================
+
+// Publish serial data (old name: publishSerialData)
+bool NetworkComm::forwardSerialData(const char* data) {
   if (!_isConnected) return false;
 
-  debugLog("Publishing serial data", data);
+  debugLog("Forwarding serial data", data);
 
   DynamicJsonDocument doc(256);
   doc["data"] = data;
@@ -923,51 +994,80 @@ bool NetworkComm::publishSerialData(const char* data) {
   return broadcastMessage(MSG_TYPE_SERIAL_DATA, doc.as<JsonObject>());
 }
 
-// Subscribe to serial data
-bool NetworkComm::subscribeToSerialData(SerialDataCallback callback) {
+// Subscribe to serial data (old name: subscribeToSerialData)
+bool NetworkComm::receiveSerialData(SerialDataCallback callback) {
   if (!_isConnected) return false;
 
-  debugLog("Subscribing to serial data");
+  debugLog("Receiving serial data");
 
   _serialDataCallback = callback;
   return true;
 }
 
-// Unsubscribe from serial data
-bool NetworkComm::unsubscribeFromSerialData() {
+// Unsubscribe from serial data (old name: unsubscribeFromSerialData)
+bool NetworkComm::stopReceivingSerialData() {
   if (!_isConnected) return false;
 
-  debugLog("Unsubscribing from serial data");
+  debugLog("Stopping serial data reception");
 
   _serialDataCallback = NULL;
   return true;
 }
 
-// Send direct message to specific board
-bool NetworkComm::sendDirectMessage(const char* targetBoard,
-                                    const char* message) {
+// ==================== Direct Messaging ====================
+
+// Send direct message to specific board (old name: sendDirectMessage)
+bool NetworkComm::sendMessageToBoardId(const char* targetBoardId,
+                                       const char* message) {
   if (!_isConnected) return false;
 
   char debugMsg[100];
-  sprintf(debugMsg, "to %s: %s", targetBoard, message);
+  sprintf(debugMsg, "to %s: %s", targetBoardId, message);
   debugLog("Sending direct message", debugMsg);
 
   DynamicJsonDocument doc(256);
   doc["message"] = message;
 
-  return sendMessage(targetBoard, MSG_TYPE_DIRECT_MESSAGE,
+  return sendMessage(targetBoardId, MSG_TYPE_DIRECT_MESSAGE,
                      doc.as<JsonObject>());
 }
 
-// Set callback for direct messages
-bool NetworkComm::setDirectMessageCallback(MessageCallback callback) {
-  debugLog("Setting direct message callback");
+// Set callback for direct messages (old name: setDirectMessageCallback)
+bool NetworkComm::receiveMessagesFromBoards(MessageCallback callback) {
+  debugLog("Setting up to receive direct messages");
 
   _directMessageCallback = callback;
   return true;
 }
 
-// Enable or disable message acknowledgements
+// ==================== Board Discovery & Network Status ====================
+
+// Check if connected to network (existing method, unchanged)
+bool NetworkComm::isConnected() {
+  return _isConnected && (WiFi.status() == WL_CONNECTED);
+}
+
+// Check if a specific board is available (existing method, unchanged)
+bool NetworkComm::isBoardAvailable(const char* boardId) {
+  for (int i = 0; i < MAX_PEERS; i++) {
+    if (_peers[i].active && strcmp(_peers[i].boardId, boardId) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Set callback for board discovery (old name: setDiscoveryCallback)
+bool NetworkComm::onBoardDiscovered(DiscoveryCallback callback) {
+  debugLog("Setting board discovery callback");
+
+  _discoveryCallback = callback;
+  return true;
+}
+
+// ==================== Debug & Diagnostic Features ====================
+
+// Enable or disable message acknowledgements (existing method, unchanged)
 bool NetworkComm::enableMessageAcknowledgements(bool enable) {
   _acknowledgementsEnabled = enable;
   char debugMsg[50];
@@ -976,12 +1076,12 @@ bool NetworkComm::enableMessageAcknowledgements(bool enable) {
   return true;
 }
 
-// Check if acknowledgements are enabled
+// Check if acknowledgements are enabled (existing method, unchanged)
 bool NetworkComm::isAcknowledgementsEnabled() {
   return _acknowledgementsEnabled;
 }
 
-// Enable or disable debug logging
+// Enable or disable debug logging (existing method, unchanged)
 bool NetworkComm::enableDebugLogging(bool enable) {
   _debugLoggingEnabled = enable;
 
@@ -992,7 +1092,7 @@ bool NetworkComm::enableDebugLogging(bool enable) {
   return true;
 }
 
-// Check if debug logging is enabled
+// Check if debug logging is enabled (existing method, unchanged)
 bool NetworkComm::isDebugLoggingEnabled() { return _debugLoggingEnabled; }
 
 // Generate a simple UUID-like message ID
@@ -1045,12 +1145,4 @@ void NetworkComm::handleAcknowledgement(const char* sender,
       break;
     }
   }
-}
-
-// Set callback for board discovery
-bool NetworkComm::setDiscoveryCallback(DiscoveryCallback callback) {
-  debugLog("Setting discovery callback");
-
-  _discoveryCallback = callback;
-  return true;
 }
