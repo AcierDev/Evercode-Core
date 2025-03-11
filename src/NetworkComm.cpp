@@ -1,34 +1,73 @@
 /**
  * NetworkComm.cpp - Library for communication between ESP32 boards
  * Created by Claude, 2023
+ * Modified to use ESP-NOW for direct communication
  */
 
 #include "NetworkComm.h"
 
-// Local MQTT broker port
-#define MQTT_PORT 1883
+// Static pointer to the current NetworkComm instance for callbacks
+static NetworkComm* _instance = nullptr;
 
-// Topic prefixes
-#define TOPIC_PREFIX "netcomm/"
-#define DISCOVERY_TOPIC TOPIC_PREFIX "discovery"
-#define PIN_TOPIC TOPIC_PREFIX "pin/"
-#define MESSAGE_TOPIC TOPIC_PREFIX "msg/"
-#define SERIAL_TOPIC TOPIC_PREFIX "serial/"
-#define DIRECT_TOPIC TOPIC_PREFIX "direct/"
+// Debug function for consistent debug output formatting
+void debugLog(const char* event, const char* details = nullptr) {
+  // Only log if debugging is enabled in the NetworkComm instance
+  if (_instance && _instance->isDebugLoggingEnabled()) {
+    Serial.print("[NetworkComm] ");
+    Serial.print(event);
+    if (details != nullptr) {
+      Serial.print(": ");
+      Serial.print(details);
+    }
+    Serial.println();
+  }
+}
 
-// Forward declaration for MQTT callback
-void mqttCallback(char* topic, byte* payload, unsigned int length);
+// Discovery broadcast interval (ms)
+#define INITIAL_DISCOVERY_INTERVAL 2000  // 2 seconds initially
+#define ACTIVE_DISCOVERY_INTERVAL 10000  // 10 seconds during active discovery
+#define STABLE_DISCOVERY_INTERVAL 30000  // 30 seconds after stable connection
 
 // Constructor
 NetworkComm::NetworkComm() {
   _isConnected = false;
   _subscriptionCount = 0;
+  _peerCount = 0;
   _directMessageCallback = NULL;
   _serialDataCallback = NULL;
+  _discoveryCallback = NULL;  // Initialize discovery callback
+  _lastDiscoveryBroadcast = 0;
+  _acknowledgementsEnabled = false;
+  _trackedMessageCount = 0;
+  _debugLoggingEnabled = false;  // Debug logging off by default
 
   // Initialize subscriptions
   for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
     _subscriptions[i].active = false;
+  }
+
+  // Initialize peers
+  for (int i = 0; i < MAX_PEERS; i++) {
+    _peers[i].active = false;
+  }
+
+  // Initialize tracked messages
+  for (int i = 0; i < MAX_TRACKED_MESSAGES; i++) {
+    _trackedMessages[i].active = false;
+  }
+
+  // Store global instance pointer for callbacks
+  _instance = this;
+}
+
+// ESP-NOW data received callback - MUST be minimal since it runs in interrupt
+// context
+void IRAM_ATTR NetworkComm::onDataReceived(const uint8_t* mac,
+                                           const uint8_t* data, int len) {
+  // DO NOT DO ANY PROCESSING OR SERIAL LOGGING HERE
+  // Just pass data to the main code and return immediately
+  if (_instance) {
+    _instance->processIncomingMessage(mac, data, len);
   }
 }
 
@@ -39,233 +78,552 @@ bool NetworkComm::begin(const char* ssid, const char* password,
   strncpy(_boardId, boardId, sizeof(_boardId) - 1);
   _boardId[sizeof(_boardId) - 1] = '\0';
 
-  // Connect to WiFi
+  // Always print a startup message, regardless of debug setting
+  Serial.print("[NetworkComm] Initializing board: ");
+  Serial.print(boardId);
+  Serial.print(", Debug: ");
+  Serial.print(_debugLoggingEnabled ? "ON" : "OFF");
+  Serial.print(", Acks: ");
+  Serial.println(_acknowledgementsEnabled ? "ON" : "OFF");
+
+  char debugMsg[100];
+  sprintf(debugMsg, "board ID: %s, SSID: %s", boardId, ssid);
+  debugLog("Initializing NetworkComm", debugMsg);
+
+  // Connect to WiFi - ESP-NOW needs WiFi in station mode
+  WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
 
   // Wait for connection (with timeout)
   unsigned long startTime = millis();
+  Serial.print("[NetworkComm] Connecting to WiFi...");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
+    Serial.print(".");
     if (millis() - startTime > 10000) {
+      Serial.println();
+      Serial.println("[NetworkComm] WiFi connection timeout");
+      debugLog("WiFi connection timeout");
       return false;  // Connection timeout
     }
   }
+  Serial.println();
+  Serial.print("[NetworkComm] Connected to WiFi, IP: ");
+  Serial.println(WiFi.localIP());
 
-  // Setup mDNS
-  setupMDNS();
+  debugLog("WiFi connected successfully");
 
-  // Setup MQTT client
-  _mqttClient.setClient(_wifiClient);
-  _mqttClient.setServer("mqtt-broker.local",
-                        MQTT_PORT);  // Use mDNS to find broker
-  _mqttClient.setCallback(mqttCallback);
+  // Get the MAC address
+  WiFi.macAddress(_macAddress);
+  char macStr[18];
+  sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", _macAddress[0],
+          _macAddress[1], _macAddress[2], _macAddress[3], _macAddress[4],
+          _macAddress[5]);
 
-  // Connect to MQTT broker
-  String clientId = "netcomm-";
-  clientId += _boardId;
-  if (_mqttClient.connect(clientId.c_str())) {
-    // Subscribe to discovery topic
-    _mqttClient.subscribe(DISCOVERY_TOPIC);
+  Serial.print("[NetworkComm] Board MAC address: ");
+  Serial.println(macStr);
+  debugLog("Board MAC address", macStr);
 
-    // Subscribe to direct messages
-    String directTopic = DIRECT_TOPIC;
-    directTopic += _boardId;
-    _mqttClient.subscribe(directTopic.c_str());
-
-    // Announce presence
-    _mqttClient.publish(DISCOVERY_TOPIC, _boardId);
-
-    _isConnected = true;
-    return true;
+  // Initialize ESP-NOW
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("[NetworkComm] ESP-NOW initialization failed");
+    debugLog("ESP-NOW initialization failed");
+    return false;
   }
 
-  return false;
+  Serial.println("[NetworkComm] ESP-NOW initialized successfully");
+  debugLog("ESP-NOW initialized successfully");
+
+  // Register callback for receiving data
+  esp_now_register_recv_cb(onDataReceived);
+  Serial.println("[NetworkComm] ESP-NOW receive callback registered");
+
+  _isConnected = true;
+
+  // Broadcast presence to discover other boards
+  broadcastPresence();
+
+  debugLog("NetworkComm initialization complete");
+
+  return true;
 }
 
 // Main loop function - must be called in loop()
 void NetworkComm::update() {
   if (!_isConnected) return;
 
-  // Handle MQTT messages
-  _mqttClient.loop();
+  uint32_t currentTime = millis();
 
-  // Check for new boards
-  checkForNewBoards();
-}
+  // Broadcast presence with varying frequency based on connection age
+  static bool firstMinute = true;
+  static bool firstFiveMinutes = true;
+  static uint32_t startTime = currentTime;
 
-// Setup mDNS
-void NetworkComm::setupMDNS() {
-  if (!MDNS.begin(_boardId)) {
-    return;
+  uint32_t discoveryInterval =
+      INITIAL_DISCOVERY_INTERVAL;  // 2 seconds initially
+
+  // After the first minute, slow down to 10 seconds
+  if (firstMinute && (currentTime - startTime > 60000)) {
+    firstMinute = false;
+    discoveryInterval = ACTIVE_DISCOVERY_INTERVAL;  // 10 seconds
   }
 
-  // Advertise MQTT service
-  MDNS.addService("mqtt", "tcp", MQTT_PORT);
+  // After five minutes, slow down further to 30 seconds
+  if (firstFiveMinutes && (currentTime - startTime > 300000)) {
+    firstFiveMinutes = false;
+    discoveryInterval = STABLE_DISCOVERY_INTERVAL;  // 30 seconds
+  }
+
+  if (currentTime - _lastDiscoveryBroadcast > discoveryInterval) {
+    broadcastPresence();
+    _lastDiscoveryBroadcast = currentTime;
+  }
+
+  // Process message acknowledgements if enabled
+  if (_acknowledgementsEnabled) {
+    // Check for message timeouts (5 second timeout)
+    const uint32_t ACK_TIMEOUT = 5000;  // 5 seconds
+
+    for (int i = 0; i < MAX_TRACKED_MESSAGES; i++) {
+      if (_trackedMessages[i].active) {
+        // Check if message timed out
+        if (!_trackedMessages[i].acknowledged &&
+            (currentTime - _trackedMessages[i].sentTime > ACK_TIMEOUT)) {
+          char debugMsg[100];
+          sprintf(debugMsg, "Message %s to %s timed out (no acknowledgement)",
+                  _trackedMessages[i].messageId,
+                  _trackedMessages[i].targetBoard);
+          debugLog(debugMsg);
+
+          // Clean up this slot
+          _trackedMessages[i].active = false;
+        }
+        // Clean up acknowledged messages after some time
+        else if (_trackedMessages[i].acknowledged &&
+                 (currentTime - _trackedMessages[i].sentTime >
+                  ACK_TIMEOUT * 2)) {
+          _trackedMessages[i].active = false;
+        }
+      }
+    }
+  }
 }
 
-// Check for new boards
-void NetworkComm::checkForNewBoards() {
-  // This would typically query mDNS for services
-  // Implementation depends on platform
+// Broadcast presence for discovery
+void NetworkComm::broadcastPresence() {
+  if (!_isConnected) return;
+
+  Serial.println("[NetworkComm] Broadcasting presence");
+
+  // Send directly with broadcast address for maximum compatibility
+  uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+  // Register broadcast address if not registered
+  if (esp_now_is_peer_exist(broadcastMac) == false) {
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, broadcastMac, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+    esp_now_add_peer(&peerInfo);
+  }
+
+  // Create a minimal discovery message
+  StaticJsonDocument<128> doc;
+  doc["sender"] = _boardId;
+  doc["type"] = MSG_TYPE_DISCOVERY;
+
+  // Serialize to JSON
+  String jsonStr;
+  serializeJson(doc, jsonStr);
+
+  // Send directly to broadcast address
+  esp_now_send(broadcastMac, (uint8_t*)jsonStr.c_str(), jsonStr.length() + 1);
 }
 
-// Process incoming MQTT messages
-void NetworkComm::processIncomingMessage(const char* topic, byte* payload,
-                                         unsigned int length) {
-  // Ensure null-terminated payload
-  char* message = new char[length + 1];
-  memcpy(message, payload, length);
-  message[length] = '\0';
+// Handle discovery message
+void NetworkComm::handleDiscovery(const char* senderId,
+                                  const uint8_t* senderMac) {
+  // Minimal logging
+  Serial.print("[NetworkComm] Discovery from: ");
+  Serial.println(senderId);
 
-  // Calculate an appropriate buffer size based on the message length
-  // For JSON, we typically need 1.5x the raw message size plus some overhead
-  const size_t capacity = length * 1.5 + 64;
-  DynamicJsonDocument doc(capacity);
+  // Add sender to peer list with minimal logging
+  bool added = addPeer(senderId, senderMac);
 
+  // If we have a discovery callback registered, call it
+  if (_discoveryCallback != NULL) {
+    _discoveryCallback(senderId);
+  }
+
+  // Don't send a response here - let the automatic broadcasting handle
+  // discovery
+}
+
+// Add a peer to our list
+bool NetworkComm::addPeer(const char* boardId, const uint8_t* macAddress) {
+  // Basic validation
+  if (!boardId || !macAddress) {
+    Serial.println("[NetworkComm] Error: Invalid peer data");
+    return false;
+  }
+
+  // Check if peer already exists
+  for (int i = 0; i < MAX_PEERS; i++) {
+    if (_peers[i].active && strcmp(_peers[i].boardId, boardId) == 0) {
+      // Update existing peer's last seen time
+      _peers[i].lastSeen = millis();
+      return true;  // Peer already exists, no need to log
+    }
+  }
+
+  // Minimal logging for new peer
+  Serial.print("[NetworkComm] Adding peer: ");
+  Serial.println(boardId);
+
+  // Find a free slot
+  int slot = -1;
+  for (int i = 0; i < MAX_PEERS; i++) {
+    if (!_peers[i].active) {
+      slot = i;
+      break;
+    }
+  }
+
+  // If no free slot, find oldest peer
+  if (slot == -1) {
+    uint32_t oldestTime = UINT32_MAX;
+    for (int i = 0; i < MAX_PEERS; i++) {
+      if (_peers[i].lastSeen < oldestTime) {
+        oldestTime = _peers[i].lastSeen;
+        slot = i;
+      }
+    }
+  }
+
+  // Add the peer
+  strncpy(_peers[slot].boardId, boardId, sizeof(_peers[slot].boardId) - 1);
+  _peers[slot].boardId[sizeof(_peers[slot].boardId) - 1] = '\0';
+  memcpy(_peers[slot].macAddress, macAddress, 6);
+  _peers[slot].active = true;
+  _peers[slot].lastSeen = millis();
+  if (_peerCount < MAX_PEERS) _peerCount++;
+
+  // Register with ESP-NOW
+  if (esp_now_is_peer_exist(macAddress) == false) {
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, macAddress, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+
+    esp_err_t result = esp_now_add_peer(&peerInfo);
+    if (result != ESP_OK) {
+      Serial.println("[NetworkComm] Failed to add ESP-NOW peer");
+    }
+  }
+
+  return true;
+}
+
+// Get MAC address for a board ID
+bool NetworkComm::getMacForBoardId(const char* boardId, uint8_t* macAddress) {
+  for (int i = 0; i < MAX_PEERS; i++) {
+    if (_peers[i].active && strcmp(_peers[i].boardId, boardId) == 0) {
+      memcpy(macAddress, _peers[i].macAddress, 6);
+      return true;
+    }
+  }
+  return false;
+}
+
+// Process incoming ESP-NOW messages
+void NetworkComm::processIncomingMessage(const uint8_t* mac,
+                                         const uint8_t* data, int len) {
+  // Ensure the data is valid
+  if (len <= 0 || len > MAX_ESP_NOW_DATA_SIZE || !data || !mac) return;
+
+  // Minimal logging
+  Serial.print("[NetworkComm] Received message, length: ");
+  Serial.println(len);
+
+  // Create a copy of the data with null-termination
+  char* message = new char[len + 1];
+  if (!message) {
+    Serial.println("[NetworkComm] Error: Failed to allocate memory");
+    return;  // Memory allocation failed
+  }
+
+  memcpy(message, data, len);
+  message[len] = '\0';
+
+  // Parse JSON with a fixed-size buffer to prevent stack issues
+  StaticJsonDocument<512>
+      doc;  // Use StaticJsonDocument instead of DynamicJsonDocument
   DeserializationError error = deserializeJson(doc, message);
 
+  // Free the memory immediately after parsing
+  delete[] message;
+  message = NULL;  // Avoid dangling pointer
+
   if (error) {
-    // Handle JSON parsing error
-    Serial.print(F("JSON parsing failed: "));
+    // JSON parsing error - don't crash
+    Serial.print("[NetworkComm] JSON parse error: ");
     Serial.println(error.c_str());
-    delete[] message;
     return;
   }
 
-  // Process based on topic
-  if (strncmp(topic, DISCOVERY_TOPIC, strlen(DISCOVERY_TOPIC)) == 0) {
-    // Handle discovery message
-  } else if (strncmp(topic, PIN_TOPIC, strlen(PIN_TOPIC)) == 0) {
-    // Handle pin control/subscription
-    const char* sender = doc["sender"];
-    uint8_t pin = doc["pin"];
-    uint8_t value = doc["value"];
-    uint8_t msgType = doc["type"];
+  // Get the sender ID and message type
+  const char* sender = doc["sender"];
+  uint8_t msgType = doc["type"];
 
-    // Find matching subscriptions
-    for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
-      if (_subscriptions[i].active &&
-          _subscriptions[i].type == MSG_TYPE_PIN_SUBSCRIBE &&
-          strcmp(_subscriptions[i].targetBoard, sender) == 0 &&
-          _subscriptions[i].pin == pin) {
-        PinChangeCallback callback =
-            (PinChangeCallback)_subscriptions[i].callback;
-        if (callback) {
-          callback(sender, pin, value);
-        }
-      }
-    }
-  } else if (strncmp(topic, MESSAGE_TOPIC, strlen(MESSAGE_TOPIC)) == 0) {
-    // Handle pub/sub messages
-    const char* sender = doc["sender"];
-    const char* msgTopic = doc["topic"];
-    const char* msgContent = doc["message"];
-
-    // Find matching subscriptions
-    for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
-      if (_subscriptions[i].active &&
-          _subscriptions[i].type == MSG_TYPE_MESSAGE &&
-          strcmp(_subscriptions[i].topic, msgTopic) == 0) {
-        MessageCallback callback = (MessageCallback)_subscriptions[i].callback;
-        if (callback) {
-          callback(sender, msgTopic, msgContent);
-        }
-      }
-    }
-  } else if (strncmp(topic, SERIAL_TOPIC, strlen(SERIAL_TOPIC)) == 0) {
-    // Handle serial data
-    const char* sender = doc["sender"];
-    const char* data = doc["data"];
-
-    if (_serialDataCallback) {
-      _serialDataCallback(sender, data);
-    }
-  } else if (strncmp(topic, DIRECT_TOPIC, strlen(DIRECT_TOPIC)) == 0) {
-    // Handle direct messages
-    const char* sender = doc["sender"];
-    const char* msgContent = doc["message"];
-
-    if (_directMessageCallback) {
-      _directMessageCallback(sender, NULL, msgContent);
-    }
+  // Minimal sender info logging
+  if (sender) {
+    Serial.print("[NetworkComm] From: ");
+    Serial.print(sender);
+    Serial.print(", type: ");
+    Serial.println(msgType);
   }
 
-  delete[] message;
+  // Process message based on type
+  switch (msgType) {
+    case MSG_TYPE_DISCOVERY:
+      if (sender) {
+        handleDiscovery(sender, mac);
+      }
+      break;
+
+    case MSG_TYPE_DISCOVERY_RESPONSE:
+      if (sender) {
+        addPeer(sender, mac);
+      }
+      break;
+
+    case MSG_TYPE_ACKNOWLEDGEMENT:
+      // Handle acknowledgement
+      if (doc.containsKey("messageId")) {
+        const char* messageId = doc["messageId"];
+        if (messageId && sender) {
+          handleAcknowledgement(sender, messageId);
+        }
+      }
+      break;
+
+    case MSG_TYPE_PIN_CONTROL:
+    case MSG_TYPE_PIN_PUBLISH:
+      if (sender && doc.containsKey("pin") && doc.containsKey("value")) {
+        uint8_t pin = doc["pin"];
+        uint8_t value = doc["value"];
+
+        // Debug logging for pin control/publish messages
+        if (_debugLoggingEnabled) {
+          char debugMsg[100];
+          sprintf(debugMsg, "Received pin %s from %s: pin=%d, value=%d",
+                  (msgType == MSG_TYPE_PIN_CONTROL) ? "control" : "publish",
+                  sender, pin, value);
+          debugLog(debugMsg);
+        }
+
+        // Process pin subscriptions
+        for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
+          if (_subscriptions[i].active &&
+              _subscriptions[i].type == MSG_TYPE_PIN_SUBSCRIBE &&
+              strcmp(_subscriptions[i].targetBoard, sender) == 0 &&
+              _subscriptions[i].pin == pin) {
+            PinChangeCallback callback =
+                (PinChangeCallback)_subscriptions[i].callback;
+            if (callback) {
+              if (_debugLoggingEnabled) {
+                debugLog("Executing pin change callback");
+              }
+              callback(sender, pin, value);
+            }
+          }
+        }
+      } else {
+        if (_debugLoggingEnabled) {
+          debugLog(
+              "Received malformed pin message (missing sender, pin, or value)");
+        }
+      }
+      break;
+
+    case MSG_TYPE_MESSAGE:
+      if (sender && doc.containsKey("topic") && doc.containsKey("message")) {
+        const char* topic = doc["topic"];
+        const char* msgContent = doc["message"];
+
+        if (topic && msgContent) {
+          // Process topic subscriptions
+          for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
+            if (_subscriptions[i].active &&
+                _subscriptions[i].type == MSG_TYPE_MESSAGE &&
+                strcmp(_subscriptions[i].topic, topic) == 0) {
+              MessageCallback callback =
+                  (MessageCallback)_subscriptions[i].callback;
+              if (callback) {
+                callback(sender, topic, msgContent);
+              }
+            }
+          }
+        }
+      }
+      break;
+
+    case MSG_TYPE_SERIAL_DATA:
+      if (sender && doc.containsKey("data")) {
+        const char* data = doc["data"];
+        if (data && _serialDataCallback) {
+          _serialDataCallback(sender, data);
+        }
+      }
+      break;
+
+    case MSG_TYPE_DIRECT_MESSAGE:
+      if (sender && doc.containsKey("message")) {
+        const char* msgContent = doc["message"];
+        if (msgContent && _directMessageCallback) {
+          _directMessageCallback(sender, NULL, msgContent);
+        }
+      }
+      break;
+  }
 }
 
 // Send a message to a specific board
-void NetworkComm::sendMessage(const char* targetBoard, uint8_t messageType,
+bool NetworkComm::sendMessage(const char* targetBoard, uint8_t messageType,
                               const JsonObject& doc) {
-  if (!_isConnected) return;
+  if (!_isConnected) return false;
+  if (!targetBoard) return false;
 
-  // Reserve memory for the outgoing document (original doc + sender and type
-  // fields) Plus extra margin for additional fields
-  const size_t capacity = JSON_OBJECT_SIZE(2) + measureJson(doc) + 30;
-  DynamicJsonDocument outDoc(capacity);
+  // Get MAC address for target board
+  uint8_t targetMac[6];
+  if (!getMacForBoardId(targetBoard, targetMac)) {
+    Serial.print("[NetworkComm] Unknown board: ");
+    Serial.println(targetBoard);
+    return false;  // Target board not found
+  }
+
+  // Create outgoing document
+  StaticJsonDocument<384> outDoc;
   outDoc.set(doc);  // Copy contents from original doc
 
-  // Add sender information
+  // Add sender and type
   outDoc["sender"] = _boardId;
   outDoc["type"] = messageType;
+
+  // Add message ID for tracking if acknowledgements are enabled
+  char messageId[37] = {0};  // UUID string
+  if (_acknowledgementsEnabled && messageType != MSG_TYPE_ACKNOWLEDGEMENT) {
+    generateMessageId(messageId);
+    outDoc["messageId"] = messageId;
+
+    // Track this message for acknowledgement
+    for (int i = 0; i < MAX_TRACKED_MESSAGES; i++) {
+      if (!_trackedMessages[i].active) {
+        strncpy(_trackedMessages[i].messageId, messageId,
+                sizeof(_trackedMessages[i].messageId) - 1);
+        _trackedMessages[i]
+            .messageId[sizeof(_trackedMessages[i].messageId) - 1] = '\0';
+
+        strncpy(_trackedMessages[i].targetBoard, targetBoard,
+                sizeof(_trackedMessages[i].targetBoard) - 1);
+        _trackedMessages[i]
+            .targetBoard[sizeof(_trackedMessages[i].targetBoard) - 1] = '\0';
+
+        _trackedMessages[i].acknowledged = false;
+        _trackedMessages[i].sentTime = millis();
+        _trackedMessages[i].active = true;
+        break;
+      }
+    }
+  }
 
   // Serialize to JSON
   String jsonStr;
   serializeJson(outDoc, jsonStr);
 
-  // Determine topic based on message type
-  String topic;
-
-  switch (messageType) {
-    case MSG_TYPE_PIN_CONTROL:
-    case MSG_TYPE_PIN_PUBLISH:
-      topic = PIN_TOPIC;
-      topic += targetBoard;
-      break;
-
-    case MSG_TYPE_MESSAGE:
-      topic = MESSAGE_TOPIC;
-      topic += doc["topic"].as<const char*>();
-      break;
-
-    case MSG_TYPE_SERIAL_DATA:
-      topic = SERIAL_TOPIC;
-      break;
-
-    case MSG_TYPE_DIRECT_MESSAGE:
-      topic = DIRECT_TOPIC;
-      topic += targetBoard;
-      break;
-
-    default:
-      return;  // Unknown message type
+  // Check if message fits ESP-NOW size limit
+  if (jsonStr.length() + 1 > MAX_ESP_NOW_DATA_SIZE) {
+    Serial.println("[NetworkComm] Error: Message too large");
+    return false;
   }
 
-  // Publish message
-  _mqttClient.publish(topic.c_str(), jsonStr.c_str());
+  // Send the message
+  esp_err_t result =
+      esp_now_send(targetMac, (uint8_t*)jsonStr.c_str(), jsonStr.length() + 1);
+  return (result == ESP_OK);
+}
+
+// Broadcast message to all peers
+bool NetworkComm::broadcastMessage(uint8_t messageType, const JsonObject& doc) {
+  if (!_isConnected) return false;
+
+  // Create outgoing document
+  StaticJsonDocument<384> outDoc;
+  outDoc.set(doc);  // Copy contents from original doc
+
+  // Add sender and type
+  outDoc["sender"] = _boardId;
+  outDoc["type"] = messageType;
+
+  // Serialize the JSON document
+  String jsonStr;
+  serializeJson(outDoc, jsonStr);
+
+  // Check if message fits ESP-NOW size limit
+  if (jsonStr.length() + 1 > MAX_ESP_NOW_DATA_SIZE) {
+    Serial.println("[NetworkComm] Error: Message too large");
+    return false;
+  }
+
+  // Always try the broadcast address first
+  uint8_t broadcastMac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+  // Register broadcast address if not already registered
+  if (esp_now_is_peer_exist(broadcastMac) == false) {
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, broadcastMac, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+
+    esp_now_add_peer(&peerInfo);
+  }
+
+  // Send to broadcast address
+  esp_err_t result = esp_now_send(broadcastMac, (uint8_t*)jsonStr.c_str(),
+                                  jsonStr.length() + 1);
+  return (result == ESP_OK);
 }
 
 // Check if connected to network
-bool NetworkComm::isConnected() { return _isConnected; }
+bool NetworkComm::isConnected() {
+  return _isConnected && (WiFi.status() == WL_CONNECTED);
+}
 
 // Check if a specific board is available
 bool NetworkComm::isBoardAvailable(const char* boardId) {
-  // This would check mDNS records
-  // Implementation depends on platform
-  return true;  // Placeholder
+  for (int i = 0; i < MAX_PEERS; i++) {
+    if (_peers[i].active && strcmp(_peers[i].boardId, boardId) == 0) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Get count of available boards
-int NetworkComm::getAvailableBoardsCount() {
-  // This would count mDNS records
-  // Implementation depends on platform
-  return 1;  // Placeholder
-}
+int NetworkComm::getAvailableBoardsCount() { return _peerCount; }
 
 // Get name of available board by index
 String NetworkComm::getAvailableBoardName(int index) {
-  // This would return board name from mDNS records
-  // Implementation depends on platform
-  return "board";  // Placeholder
+  int count = 0;
+  for (int i = 0; i < MAX_PEERS; i++) {
+    if (_peers[i].active) {
+      if (count == index) {
+        return String(_peers[i].boardId);
+      }
+      count++;
+    }
+  }
+  return String("");
 }
 
 // Set pin value on remote board
@@ -273,19 +631,25 @@ bool NetworkComm::setPinValue(const char* targetBoard, uint8_t pin,
                               uint8_t value) {
   if (!_isConnected) return false;
 
-  // For a simple pin value object with pin and value fields
-  const size_t capacity = JSON_OBJECT_SIZE(2);
-  DynamicJsonDocument doc(capacity);
+  char debugMsg[100];
+  sprintf(debugMsg, "board %s, pin %d, value %d", targetBoard, pin, value);
+  debugLog("Setting pin value", debugMsg);
+
+  DynamicJsonDocument doc(64);
   doc["pin"] = pin;
   doc["value"] = value;
 
-  sendMessage(targetBoard, MSG_TYPE_PIN_CONTROL, doc.as<JsonObject>());
-  return true;
+  return sendMessage(targetBoard, MSG_TYPE_PIN_CONTROL, doc.as<JsonObject>());
 }
 
 // Get pin value from remote board (this would be async in reality)
 uint8_t NetworkComm::getPinValue(const char* targetBoard, uint8_t pin) {
   // This would need to be implemented with a request/response pattern
+
+  char debugMsg[100];
+  sprintf(debugMsg, "board %s, pin %d", targetBoard, pin);
+  debugLog("Getting pin value", debugMsg);
+
   // For simplicity, we're returning 0
   return 0;
 }
@@ -294,6 +658,10 @@ uint8_t NetworkComm::getPinValue(const char* targetBoard, uint8_t pin) {
 bool NetworkComm::subscribeToPinChange(const char* targetBoard, uint8_t pin,
                                        PinChangeCallback callback) {
   if (!_isConnected) return false;
+
+  char debugMsg[100];
+  sprintf(debugMsg, "to board %s, pin %d", targetBoard, pin);
+  debugLog("Subscribing to pin change", debugMsg);
 
   // Find free subscription slot
   int slot = -1;
@@ -316,24 +684,21 @@ bool NetworkComm::subscribeToPinChange(const char* targetBoard, uint8_t pin,
   _subscriptions[slot].callback = (void*)callback;
   _subscriptions[slot].active = true;
 
-  // Subscribe to pin topic
-  String topic = PIN_TOPIC;
-  topic += targetBoard;
-  _mqttClient.subscribe(topic.c_str());
-
-  // For a simple pin object with just one field
-  const size_t capacity = JSON_OBJECT_SIZE(1);
-  DynamicJsonDocument doc(capacity);
+  // Send subscription request to target board
+  DynamicJsonDocument doc(64);
   doc["pin"] = pin;
 
-  sendMessage(targetBoard, MSG_TYPE_PIN_SUBSCRIBE, doc.as<JsonObject>());
-  return true;
+  return sendMessage(targetBoard, MSG_TYPE_PIN_SUBSCRIBE, doc.as<JsonObject>());
 }
 
 // Unsubscribe from pin changes
 bool NetworkComm::unsubscribeFromPinChange(const char* targetBoard,
                                            uint8_t pin) {
   if (!_isConnected) return false;
+
+  char debugMsg[100];
+  sprintf(debugMsg, "from board %s, pin %d", targetBoard, pin);
+  debugLog("Unsubscribing from pin change", debugMsg);
 
   // Find matching subscription
   for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
@@ -353,20 +718,22 @@ bool NetworkComm::unsubscribeFromPinChange(const char* targetBoard,
 bool NetworkComm::publish(const char* topic, const char* message) {
   if (!_isConnected) return false;
 
-  // Calculate capacity for topic and message fields
-  const size_t capacity =
-      JSON_OBJECT_SIZE(2) + strlen(topic) + strlen(message) + 20;
-  DynamicJsonDocument doc(capacity);
+  char debugMsg[100];
+  sprintf(debugMsg, "topic '%s', message: %s", topic, message);
+  debugLog("Publishing message", debugMsg);
+
+  DynamicJsonDocument doc(256);
   doc["topic"] = topic;
   doc["message"] = message;
 
-  sendMessage(NULL, MSG_TYPE_MESSAGE, doc.as<JsonObject>());
-  return true;
+  return broadcastMessage(MSG_TYPE_MESSAGE, doc.as<JsonObject>());
 }
 
 // Subscribe to topic
 bool NetworkComm::subscribe(const char* topic, MessageCallback callback) {
   if (!_isConnected) return false;
+
+  debugLog("Subscribing to topic", topic);
 
   // Find free subscription slot
   int slot = -1;
@@ -387,11 +754,6 @@ bool NetworkComm::subscribe(const char* topic, MessageCallback callback) {
   _subscriptions[slot].callback = (void*)callback;
   _subscriptions[slot].active = true;
 
-  // Subscribe to message topic
-  String mqttTopic = MESSAGE_TOPIC;
-  mqttTopic += topic;
-  _mqttClient.subscribe(mqttTopic.c_str());
-
   return true;
 }
 
@@ -399,18 +761,14 @@ bool NetworkComm::subscribe(const char* topic, MessageCallback callback) {
 bool NetworkComm::unsubscribe(const char* topic) {
   if (!_isConnected) return false;
 
+  debugLog("Unsubscribing from topic", topic);
+
   // Find matching subscription
   for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
     if (_subscriptions[i].active &&
         _subscriptions[i].type == MSG_TYPE_MESSAGE &&
         strcmp(_subscriptions[i].topic, topic) == 0) {
       _subscriptions[i].active = false;
-
-      // Unsubscribe from MQTT topic
-      String mqttTopic = MESSAGE_TOPIC;
-      mqttTopic += topic;
-      _mqttClient.unsubscribe(mqttTopic.c_str());
-
       return true;
     }
   }
@@ -422,24 +780,21 @@ bool NetworkComm::unsubscribe(const char* topic) {
 bool NetworkComm::publishSerialData(const char* data) {
   if (!_isConnected) return false;
 
-  // Calculate capacity based on data size
-  const size_t capacity = JSON_OBJECT_SIZE(1) + strlen(data) + 10;
-  DynamicJsonDocument doc(capacity);
+  debugLog("Publishing serial data", data);
+
+  DynamicJsonDocument doc(256);
   doc["data"] = data;
 
-  sendMessage(NULL, MSG_TYPE_SERIAL_DATA, doc.as<JsonObject>());
-  return true;
+  return broadcastMessage(MSG_TYPE_SERIAL_DATA, doc.as<JsonObject>());
 }
 
 // Subscribe to serial data
 bool NetworkComm::subscribeToSerialData(SerialDataCallback callback) {
   if (!_isConnected) return false;
 
+  debugLog("Subscribing to serial data");
+
   _serialDataCallback = callback;
-
-  // Subscribe to serial topic
-  _mqttClient.subscribe(SERIAL_TOPIC);
-
   return true;
 }
 
@@ -447,11 +802,9 @@ bool NetworkComm::subscribeToSerialData(SerialDataCallback callback) {
 bool NetworkComm::unsubscribeFromSerialData() {
   if (!_isConnected) return false;
 
+  debugLog("Unsubscribing from serial data");
+
   _serialDataCallback = NULL;
-
-  // Unsubscribe from serial topic
-  _mqttClient.unsubscribe(SERIAL_TOPIC);
-
   return true;
 }
 
@@ -460,28 +813,109 @@ bool NetworkComm::sendDirectMessage(const char* targetBoard,
                                     const char* message) {
   if (!_isConnected) return false;
 
-  // Calculate the capacity needed for the message
-  // JSON_OBJECT_SIZE(2) accounts for the {"message": "value", "sender":
-  // "value"} structure
-  const size_t capacity =
-      JSON_OBJECT_SIZE(2) + strlen(message) + strlen(_boardId) + 20;
-  DynamicJsonDocument doc(capacity);
+  char debugMsg[100];
+  sprintf(debugMsg, "to %s: %s", targetBoard, message);
+  debugLog("Sending direct message", debugMsg);
 
+  DynamicJsonDocument doc(256);
   doc["message"] = message;
 
-  sendMessage(targetBoard, MSG_TYPE_DIRECT_MESSAGE, doc.as<JsonObject>());
-  return true;
+  return sendMessage(targetBoard, MSG_TYPE_DIRECT_MESSAGE,
+                     doc.as<JsonObject>());
 }
 
 // Set callback for direct messages
 bool NetworkComm::setDirectMessageCallback(MessageCallback callback) {
+  debugLog("Setting direct message callback");
+
   _directMessageCallback = callback;
   return true;
 }
 
-// MQTT callback function
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  // This needs to be connected to the NetworkComm instance
-  // In a real implementation, we would use a static pointer to the instance
-  // For now, this is just a placeholder
+// Enable or disable message acknowledgements
+bool NetworkComm::enableMessageAcknowledgements(bool enable) {
+  _acknowledgementsEnabled = enable;
+  char debugMsg[50];
+  sprintf(debugMsg, "Acknowledgements %s", enable ? "enabled" : "disabled");
+  debugLog(debugMsg);
+  return true;
+}
+
+// Check if acknowledgements are enabled
+bool NetworkComm::isAcknowledgementsEnabled() {
+  return _acknowledgementsEnabled;
+}
+
+// Enable or disable debug logging
+bool NetworkComm::enableDebugLogging(bool enable) {
+  _debugLoggingEnabled = enable;
+
+  // This log will only appear if debug is being enabled
+  if (enable) {
+    Serial.println("[NetworkComm] Debug logging enabled");
+  }
+  return true;
+}
+
+// Check if debug logging is enabled
+bool NetworkComm::isDebugLoggingEnabled() { return _debugLoggingEnabled; }
+
+// Generate a simple UUID-like message ID
+void NetworkComm::generateMessageId(char* buffer) {
+  const char* chars = "0123456789abcdef";
+
+  // Format: 8-4-4-4-12 (standard UUID format)
+  int pos = 0;
+  for (int i = 0; i < 36; i++) {
+    if (i == 8 || i == 13 || i == 18 || i == 23) {
+      buffer[i] = '-';
+    } else {
+      uint8_t random_val = random(0, 16);
+      buffer[i] = chars[random_val];
+    }
+  }
+  buffer[36] = '\0';
+}
+
+// Send an acknowledgement for a received message
+void NetworkComm::sendAcknowledgement(const char* sender,
+                                      const char* messageId) {
+  if (!_isConnected) return;
+
+  DynamicJsonDocument doc(128);
+  doc["messageId"] = messageId;
+
+  char debugMsg[100];
+  sprintf(debugMsg, "Acknowledging message %s to %s", messageId, sender);
+  debugLog(debugMsg);
+
+  sendMessage(sender, MSG_TYPE_ACKNOWLEDGEMENT, doc.as<JsonObject>());
+}
+
+// Handle an incoming acknowledgement message
+void NetworkComm::handleAcknowledgement(const char* sender,
+                                        const char* messageId) {
+  char debugMsg[100];
+  sprintf(debugMsg, "Received acknowledgement for %s from %s", messageId,
+          sender);
+  debugLog(debugMsg);
+
+  // Find and update the tracked message
+  for (int i = 0; i < MAX_TRACKED_MESSAGES; i++) {
+    if (_trackedMessages[i].active &&
+        strcmp(_trackedMessages[i].messageId, messageId) == 0) {
+      _trackedMessages[i].acknowledged = true;
+      sprintf(debugMsg, "Message %s acknowledged by %s", messageId, sender);
+      debugLog(debugMsg);
+      break;
+    }
+  }
+}
+
+// Set callback for board discovery
+bool NetworkComm::setDiscoveryCallback(DiscoveryCallback callback) {
+  debugLog("Setting discovery callback");
+
+  _discoveryCallback = callback;
+  return true;
 }
