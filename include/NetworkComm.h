@@ -2,6 +2,7 @@
  * NetworkComm.h - Library for communication between ESP32 boards
  * Created by Claude, 2023
  * Modified to use ESP-NOW for direct communication
+ * Refactored into a modular architecture in 2024
  *
  * This library enables communication between ESP32 boards using
  * ESP-NOW for direct peer-to-peer data exchange.
@@ -17,10 +18,12 @@
 #ifndef NetworkComm_h
 #define NetworkComm_h
 
-#include <Arduino.h>
-#include <ArduinoJson.h>
-#include <WiFi.h>
-#include <esp_now.h>
+#include "NetworkCore.h"
+#include "NetworkDiagnostics.h"
+#include "NetworkDiscovery.h"
+#include "NetworkMessaging.h"
+#include "NetworkPinControl.h"
+#include "NetworkSerial.h"
 
 // Message types
 #define MSG_TYPE_PIN_CONTROL 1
@@ -71,7 +74,6 @@ class NetworkComm {
    */
   NetworkComm();
 
-  // ==================== Initialization ====================
   /**
    * Initialize the network communication
    *
@@ -87,12 +89,10 @@ class NetworkComm {
    * Main loop function that must be called regularly
    *
    * This function handles message timeouts, acknowledgements, and periodic
-   * tasks like broadcasting board presence. It should be called in the Arduino
-   * loop().
+   * tasks. It should be called in the Arduino loop().
    */
   void update();
 
-  // ==================== Board Discovery & Network Status ====================
   /**
    * Check if the board is connected to the network
    *
@@ -100,6 +100,7 @@ class NetworkComm {
    */
   bool isConnected();
 
+  // ==================== Board Discovery & Network Status ====================
   /**
    * Check if a specific board is available on the network
    *
@@ -215,13 +216,6 @@ class NetworkComm {
    * @param value The value to set (HIGH/LOW)
    * @param callback Optional callback to be called when the operation completes
    * @return true if the message was sent successfully
-   *
-   * Examples:
-   * - controlRemotePin("boardA", 13, HIGH)
-   *   Simple pin control, no feedback
-   *
-   * - controlRemotePin("boardA", 13, HIGH, myCallback)
-   *   Callback triggered when message is delivered or fails
    */
   bool controlRemotePin(const char* targetBoardId, uint8_t pin, uint8_t value,
                         PinControlConfirmCallback callback = NULL);
@@ -240,9 +234,7 @@ class NetworkComm {
    */
   bool controlRemotePinWithConfirmation(const char* targetBoardId, uint8_t pin,
                                         uint8_t value,
-                                        PinControlConfirmCallback callback) {
-    return controlRemotePin(targetBoardId, pin, value, callback);
-  }
+                                        PinControlConfirmCallback callback);
 
   /**
    * Clear all pin control confirmation callbacks
@@ -414,191 +406,15 @@ class NetworkComm {
   bool receiveMessagesFromBoards(MessageCallback callback);
 
  private:
-  // Board identification
-  char _boardId[32];
-  uint8_t _macAddress[6];
-  bool _isConnected;
-  bool _acknowledgementsEnabled;
-  bool _debugLoggingEnabled;
-  bool _verboseLoggingEnabled;
+  // Core network instance
+  NetworkCore _core;
 
-  // Message tracking for acknowledgements
-  static const int MAX_TRACKED_MESSAGES = 10;
-  struct MessageTrack {
-    char messageId[37];  // UUID string length
-    char targetBoard[32];
-    bool acknowledged;
-    uint32_t sentTime;
-    bool active;
-    uint8_t messageType;  // Store the message type
-    // For pin control confirmations, store the callback for this specific
-    // message
-    PinControlConfirmCallback confirmCallback;
-    // Store pin control data for callbacks
-    uint8_t pin;
-    uint8_t value;
-  };
-
-  MessageTrack _trackedMessages[MAX_TRACKED_MESSAGES];
-  int _trackedMessageCount;
-
-  // ESP-NOW send callback
-  static void onDataSent(const uint8_t* mac_addr, esp_now_send_status_t status);
-  void handleSendStatus(const uint8_t* mac_addr, esp_now_send_status_t status);
-  SendStatusCallback _sendStatusCallback;
-  SendFailureCallback _sendFailureCallback;
-
-  // Message acknowledgement handling
-  /**
-   * Send an acknowledgement for a received message
-   *
-   * @param sender The board ID that sent the original message
-   * @param messageId The ID of the message to acknowledge
-   */
-  void sendAcknowledgement(const char* sender, const char* messageId);
-
-  /**
-   * Handle an incoming acknowledgement message
-   *
-   * @param sender The board ID that sent the acknowledgement
-   * @param messageId The ID of the message being acknowledged
-   */
-  void handleAcknowledgement(const char* sender, const char* messageId);
-
-  /**
-   * Generate a unique message ID for tracking
-   *
-   * @param buffer Character buffer to store the generated ID (should be at
-   * least 37 bytes)
-   */
-  void generateMessageId(char* buffer);
-
-  // Peer management
-  struct PeerInfo {
-    char boardId[32];
-    uint8_t macAddress[6];
-    bool active;
-    uint32_t lastSeen;
-  };
-
-  PeerInfo _peers[MAX_PEERS];
-  int _peerCount;
-
-  // Discovery handling
-  /**
-   * Broadcast this board's presence to the network
-   *
-   * Used for discovery by other boards.
-   */
-  void broadcastPresence();
-
-  /**
-   * Handle a discovery message from another board
-   *
-   * @param senderId The ID of the board that sent the discovery message
-   * @param senderMac The MAC address of the board that sent the discovery
-   * message
-   */
-  void handleDiscovery(const char* senderId, const uint8_t* senderMac);
-
-  /**
-   * Add a peer to the list of known boards
-   *
-   * @param boardId The ID of the board to add
-   * @param macAddress The MAC address of the board to add
-   * @return true if the peer was added successfully
-   */
-  bool addPeer(const char* boardId, const uint8_t* macAddress);
-
-  /**
-   * Get the MAC address for a board ID
-   *
-   * @param boardId The ID of the board to look up
-   * @param macAddress Buffer to store the MAC address (must be at least 6
-   * bytes)
-   * @return true if the board was found and the MAC address was written
-   */
-  bool getMacForBoardId(const char* boardId, uint8_t* macAddress);
-
-  /**
-   * Find a board ID from a MAC address
-   *
-   * @param macAddress The MAC address to look up
-   * @param boardId Buffer to store the board ID (should be at least 32 bytes)
-   * @return true if the MAC address was found and the board ID was written
-   */
-  bool getBoardIdForMac(const uint8_t* macAddress, char* boardId);
-
-  // Message handling
-  /**
-   * ESP-NOW data received callback (static)
-   *
-   * Called by ESP-NOW when data is received. This function runs in interrupt
-   * context and should do minimal processing.
-   *
-   * @param mac The MAC address of the sender
-   * @param data The received data
-   * @param len The length of the received data
-   */
-  static void onDataReceived(const uint8_t* mac, const uint8_t* data, int len);
-
-  /**
-   * Process an incoming message
-   *
-   * @param mac The MAC address of the sender
-   * @param data The received data
-   * @param len The length of the received data
-   */
-  void processIncomingMessage(const uint8_t* mac, const uint8_t* data, int len);
-
-  /**
-   * Send a message to a specific board
-   *
-   * @param targetBoard The ID of the target board
-   * @param messageType The type of message to send
-   * @param doc The JSON object containing the message payload
-   * @return true if the message was sent successfully
-   */
-  bool sendMessage(const char* targetBoard, uint8_t messageType,
-                   const JsonObject& doc);
-
-  /**
-   * Broadcast a message to all boards on the network
-   *
-   * @param messageType The type of message to broadcast
-   * @param doc The JSON object containing the message payload
-   * @return true if the broadcast was sent successfully
-   */
-  bool broadcastMessage(uint8_t messageType, const JsonObject& doc);
-
-  // Subscription management
-  struct Subscription {
-    char topic[32];
-    char targetBoard[32];
-    uint8_t pin;
-    uint8_t type;
-    void* callback;
-    bool active;
-  };
-
-  Subscription _subscriptions[MAX_SUBSCRIPTIONS];
-  int _subscriptionCount;
-
-  // Callback handlers
-  MessageCallback _directMessageCallback;
-  SerialDataCallback _serialDataCallback;
-  DiscoveryCallback _discoveryCallback;
-  PinControlConfirmCallback _pinControlConfirmCallback;
-
-  // Internal helper functions
-  uint32_t _lastDiscoveryBroadcast;
-
-  /**
-   * Perform network discovery
-   *
-   * Sends discovery messages and processes discovery responses.
-   */
-  void performDiscovery();
+  // Module instances
+  NetworkDiscovery _discovery;
+  NetworkPinControl _pinControl;
+  NetworkMessaging _messaging;
+  NetworkSerial _serial;
+  NetworkDiagnostics _diagnostics;
 };
 
 #endif
