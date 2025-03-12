@@ -32,8 +32,6 @@
 #define MSG_TYPE_DISCOVERY 7
 #define MSG_TYPE_DISCOVERY_RESPONSE 8
 #define MSG_TYPE_ACKNOWLEDGEMENT 9
-#define MSG_TYPE_PIN_CONTROL_CONFIRM 10
-#define MSG_TYPE_PIN_CONTROL_RESPONSE 11
 
 // Maximum number of subscriptions
 #define MAX_SUBSCRIPTIONS 20
@@ -55,6 +53,13 @@ typedef void (*SerialDataCallback)(const char* sender, const char* data);
 typedef void (*DiscoveryCallback)(const char* boardId);
 typedef void (*PinControlConfirmCallback)(const char* sender, uint8_t pin,
                                           uint8_t value, bool success);
+// New callback type for ESP-NOW send status
+typedef void (*SendStatusCallback)(const char* targetBoardId,
+                                   uint8_t messageType, bool success);
+// New callback specifically for send failures
+typedef void (*SendFailureCallback)(const char* targetBoardId,
+                                    uint8_t messageType, uint8_t pin,
+                                    uint8_t value);
 
 class NetworkComm {
  public:
@@ -177,6 +182,29 @@ class NetworkComm {
    */
   bool isVerboseLoggingEnabled();
 
+  /**
+   * Register a callback for ESP-NOW send status
+   *
+   * This will be called whenever an ESP-NOW message is sent, with the status
+   * of the transmission (success or failure)
+   *
+   * @param callback Function to call when a message send status is received
+   * @return true if the callback was set successfully
+   */
+  bool onSendStatus(SendStatusCallback callback);
+
+  /**
+   * Register a callback specifically for message delivery failures
+   *
+   * This will be called only when an ESP-NOW message fails to deliver.
+   * For pin control messages, the pin and value will be included in the
+   * callback. For other message types, the pin and value will be 0.
+   *
+   * @param callback Function to call when a message fails to deliver
+   * @return true if the callback was set successfully
+   */
+  bool onSendFailure(SendFailureCallback callback);
+
   // ==================== Remote Pin Control (Controller Side)
   // ====================
   /**
@@ -186,41 +214,34 @@ class NetworkComm {
    * @param pin The pin number to control
    * @param value The value to set (HIGH/LOW)
    * @param callback Optional callback to be called when the operation completes
-   * or times out
-   * @param requireConfirmation If true, waits for confirmation from the remote
-   * board
    * @return true if the message was sent successfully
    *
    * Examples:
    * - controlRemotePin("boardA", 13, HIGH)
-   *   Simple pin control without callback or confirmation
+   *   Simple pin control, no feedback
    *
    * - controlRemotePin("boardA", 13, HIGH, myCallback)
-   *   Pin control with callback but no explicit confirmation
-   *
-   * - controlRemotePin("boardA", 13, HIGH, myCallback, true)
-   *   Full pin control with callback and confirmation
+   *   Callback triggered when message is delivered or fails
    */
   bool controlRemotePin(const char* targetBoardId, uint8_t pin, uint8_t value,
-                        PinControlConfirmCallback callback = NULL,
-                        bool requireConfirmation = false);
+                        PinControlConfirmCallback callback = NULL);
 
   /**
-   * Control a pin on a remote board with confirmation (DEPRECATED)
+   * Control a pin on a remote board with confirmation
+   *
+   * This method is maintained for backward compatibility and will be removed in
+   * a future version. Please use controlRemotePin with callback instead.
    *
    * @param targetBoardId The ID of the target board
    * @param pin The pin number to control
    * @param value The value to set (HIGH/LOW)
    * @param callback Function to call when the operation completes or times out
    * @return true if the message was sent successfully
-   *
-   * @deprecated Use controlRemotePin with callback and requireConfirmation=true
-   * instead
    */
   bool controlRemotePinWithConfirmation(const char* targetBoardId, uint8_t pin,
                                         uint8_t value,
                                         PinControlConfirmCallback callback) {
-    return controlRemotePin(targetBoardId, pin, value, callback, true);
+    return controlRemotePin(targetBoardId, pin, value, callback);
   }
 
   /**
@@ -266,27 +287,25 @@ class NetworkComm {
   bool stopHandlingPinControl();
 
   /**
-   * Accept pin control from a specific board for a specific pin (DEPRECATED)
+   * Accept pin control from a specific board for a specific pin
+   *
+   * This method allows specific pin control from specific boards.
+   * Consider using handlePinControl for more flexible pin control handling.
    *
    * @param controllerBoardId The ID of the board to accept control from
    * @param pin The pin to allow control of
    * @param callback Function to call when pin control is received
    * @return true if the subscription was added successfully
-   *
-   * @deprecated Use handlePinControl instead
    */
   bool acceptPinControlFrom(const char* controllerBoardId, uint8_t pin,
                             PinChangeCallback callback);
 
   /**
    * Stop accepting pin control from a specific board for a specific pin
-   * (DEPRECATED)
    *
    * @param controllerBoardId The ID of the board to stop accepting control from
    * @param pin The pin to stop allowing control of
    * @return true if the subscription was removed successfully
-   *
-   * @deprecated Use stopHandlingPinControl instead
    */
   bool stopAcceptingPinControlFrom(const char* controllerBoardId, uint8_t pin);
 
@@ -394,204 +413,6 @@ class NetworkComm {
    */
   bool receiveMessagesFromBoards(MessageCallback callback);
 
-  // ==================== Deprecated API (for backward compatibility)
-  // ==================== These methods are kept for backward compatibility but
-  // will be removed in future versions
-
-  // Pin control (deprecated)
-  /**
-   * Set a pin value on a remote board (DEPRECATED)
-   *
-   * @param targetBoard The ID of the target board
-   * @param pin The pin number to control
-   * @param value The value to set (HIGH/LOW)
-   * @return true if the message was sent successfully
-   *
-   * @deprecated Use controlRemotePin instead
-   */
-  bool setPinValue(const char* targetBoard, uint8_t pin, uint8_t value) {
-    return controlRemotePin(targetBoard, pin, value);
-  }
-
-  /**
-   * Set a pin value on a remote board with confirmation (DEPRECATED)
-   *
-   * @param targetBoard The ID of the target board
-   * @param pin The pin number to control
-   * @param value The value to set (HIGH/LOW)
-   * @param callback Function to call when the operation completes or times out
-   * @return true if the message was sent successfully
-   *
-   * @deprecated Use controlRemotePin with callback and requireConfirmation=true
-   * instead
-   */
-  bool setPinValueWithConfirmation(const char* targetBoard, uint8_t pin,
-                                   uint8_t value,
-                                   PinControlConfirmCallback callback) {
-    return controlRemotePinWithConfirmation(targetBoard, pin, value, callback);
-  }
-
-  /**
-   * Clear the pin control confirmation callback (DEPRECATED)
-   *
-   * @return true if the callback was cleared successfully
-   *
-   * @deprecated Use clearRemotePinConfirmCallback instead
-   */
-  bool clearPinControlConfirmCallback() {
-    return clearRemotePinConfirmCallback();
-  }
-
-  /**
-   * Get the value of a pin on a remote board (DEPRECATED)
-   *
-   * @param targetBoard The ID of the target board
-   * @param pin The pin number to read
-   * @return The pin value (currently always returns 0)
-   *
-   * @deprecated Use readRemotePin instead
-   */
-  uint8_t getPinValue(const char* targetBoard, uint8_t pin) {
-    return readRemotePin(targetBoard, pin);
-  }
-
-  // Pin subscription (deprecated)
-  /**
-   * Subscribe to pin changes on a remote board (DEPRECATED)
-   *
-   * @param targetBoard The ID of the board to subscribe to
-   * @param pin The pin to subscribe to
-   * @param callback Function to call when the pin changes
-   * @return true if the subscription was added successfully
-   *
-   * @deprecated Use acceptPinControlFrom instead
-   */
-  bool subscribeToPinChange(const char* targetBoard, uint8_t pin,
-                            PinChangeCallback callback) {
-    return acceptPinControlFrom(targetBoard, pin, callback);
-  }
-
-  /**
-   * Unsubscribe from pin changes on a remote board (DEPRECATED)
-   *
-   * @param targetBoard The ID of the board to unsubscribe from
-   * @param pin The pin to unsubscribe from
-   * @return true if the subscription was removed successfully
-   *
-   * @deprecated Use stopAcceptingPinControlFrom instead
-   */
-  bool unsubscribeFromPinChange(const char* targetBoard, uint8_t pin) {
-    return stopAcceptingPinControlFrom(targetBoard, pin);
-  }
-
-  // Message pub/sub (deprecated)
-  /**
-   * Publish a message to a topic (DEPRECATED)
-   *
-   * @param topic The topic to publish to
-   * @param message The message to publish
-   * @return true if the message was sent successfully
-   *
-   * @deprecated Use publishTopic instead
-   */
-  bool publish(const char* topic, const char* message) {
-    return publishTopic(topic, message);
-  }
-
-  /**
-   * Subscribe to a topic (DEPRECATED)
-   *
-   * @param topic The topic to subscribe to
-   * @param callback Function to call when a message is received on this topic
-   * @return true if the subscription was added successfully
-   *
-   * @deprecated Use subscribeTopic instead
-   */
-  bool subscribe(const char* topic, MessageCallback callback) {
-    return subscribeTopic(topic, callback);
-  }
-
-  /**
-   * Unsubscribe from a topic (DEPRECATED)
-   *
-   * @param topic The topic to unsubscribe from
-   * @return true if the subscription was removed successfully
-   *
-   * @deprecated Use unsubscribeTopic instead
-   */
-  bool unsubscribe(const char* topic) { return unsubscribeTopic(topic); }
-
-  // Serial data pub/sub (deprecated)
-  /**
-   * Publish serial data (DEPRECATED)
-   *
-   * @param data The data to publish
-   * @return true if the data was sent successfully
-   *
-   * @deprecated Use forwardSerialData instead
-   */
-  bool publishSerialData(const char* data) { return forwardSerialData(data); }
-
-  /**
-   * Subscribe to serial data (DEPRECATED)
-   *
-   * @param callback Function to call when serial data is received
-   * @return true if the callback was set successfully
-   *
-   * @deprecated Use receiveSerialData instead
-   */
-  bool subscribeToSerialData(SerialDataCallback callback) {
-    return receiveSerialData(callback);
-  }
-
-  /**
-   * Unsubscribe from serial data (DEPRECATED)
-   *
-   * @return true if the callback was cleared successfully
-   *
-   * @deprecated Use stopReceivingSerialData instead
-   */
-  bool unsubscribeFromSerialData() { return stopReceivingSerialData(); }
-
-  // Direct messaging (deprecated)
-  /**
-   * Send a direct message to a board (DEPRECATED)
-   *
-   * @param targetBoard The ID of the board to send the message to
-   * @param message The message to send
-   * @return true if the message was sent successfully
-   *
-   * @deprecated Use sendMessageToBoardId instead
-   */
-  bool sendDirectMessage(const char* targetBoard, const char* message) {
-    return sendMessageToBoardId(targetBoard, message);
-  }
-
-  /**
-   * Set a callback for direct messages (DEPRECATED)
-   *
-   * @param callback Function to call when a direct message is received
-   * @return true if the callback was set successfully
-   *
-   * @deprecated Use receiveMessagesFromBoards instead
-   */
-  bool setDirectMessageCallback(MessageCallback callback) {
-    return receiveMessagesFromBoards(callback);
-  }
-
-  // Board Discovery (deprecated)
-  /**
-   * Set a callback for board discovery (DEPRECATED)
-   *
-   * @param callback Function to call when a new board is discovered
-   * @return true if the callback was set successfully
-   *
-   * @deprecated Use onBoardDiscovered instead
-   */
-  bool setDiscoveryCallback(DiscoveryCallback callback) {
-    return onBoardDiscovered(callback);
-  }
-
  private:
   // Board identification
   char _boardId[32];
@@ -613,10 +434,19 @@ class NetworkComm {
     // For pin control confirmations, store the callback for this specific
     // message
     PinControlConfirmCallback confirmCallback;
+    // Store pin control data for callbacks
+    uint8_t pin;
+    uint8_t value;
   };
 
   MessageTrack _trackedMessages[MAX_TRACKED_MESSAGES];
   int _trackedMessageCount;
+
+  // ESP-NOW send callback
+  static void onDataSent(const uint8_t* mac_addr, esp_now_send_status_t status);
+  void handleSendStatus(const uint8_t* mac_addr, esp_now_send_status_t status);
+  SendStatusCallback _sendStatusCallback;
+  SendFailureCallback _sendFailureCallback;
 
   // Message acknowledgement handling
   /**
@@ -689,6 +519,15 @@ class NetworkComm {
    * @return true if the board was found and the MAC address was written
    */
   bool getMacForBoardId(const char* boardId, uint8_t* macAddress);
+
+  /**
+   * Find a board ID from a MAC address
+   *
+   * @param macAddress The MAC address to look up
+   * @param boardId Buffer to store the board ID (should be at least 32 bytes)
+   * @return true if the MAC address was found and the board ID was written
+   */
+  bool getBoardIdForMac(const uint8_t* macAddress, char* boardId);
 
   // Message handling
   /**
