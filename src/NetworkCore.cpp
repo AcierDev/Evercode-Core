@@ -5,6 +5,7 @@
 
 #include "NetworkCore.h"
 
+#include "NetworkDiscovery.h"
 #include "NetworkPinControl.h"
 
 // Static instance pointer for callbacks
@@ -20,6 +21,7 @@ NetworkCore::NetworkCore() {
   _trackedMessageCount = 0;
   _sendStatusCallback = NULL;
   _sendFailureCallback = NULL;
+  _discoveryHandler = NULL;  // Initialize discovery handler to NULL
 
   // Initialize peers
   for (int i = 0; i < MAX_PEERS; i++) {
@@ -107,12 +109,25 @@ bool NetworkCore::begin(const char* ssid, const char* password,
   debugLog("ESP-NOW initialized successfully");
 
   // Register callback for receiving data
-  esp_now_register_recv_cb(onDataReceived);
-  Serial.println("[NetworkCore] ESP-NOW receive callback registered");
+  esp_err_t recv_result = esp_now_register_recv_cb(onDataReceived);
+  if (recv_result != ESP_OK) {
+    Serial.print(
+        "[NetworkCore] ESP-NOW receive callback registration failed with "
+        "error: ");
+    Serial.println(recv_result);
+  } else {
+    Serial.println("[NetworkCore] ESP-NOW receive callback registered");
+  }
 
   // Register callback for send status
-  esp_now_register_send_cb(onDataSent);
-  Serial.println("[NetworkCore] ESP-NOW send callback registered");
+  esp_err_t send_result = esp_now_register_send_cb(onDataSent);
+  if (send_result != ESP_OK) {
+    Serial.print(
+        "[NetworkCore] ESP-NOW send callback registration failed with error: ");
+    Serial.println(send_result);
+  } else {
+    Serial.println("[NetworkCore] ESP-NOW send callback registered");
+  }
 
   _isConnected = true;
 
@@ -328,12 +343,34 @@ void NetworkCore::processIncomingMessage(const uint8_t* mac,
   switch (msgType) {
     case MSG_TYPE_DISCOVERY:
       // Discovery messages are handled by the NetworkDiscovery class
+      Serial.print("[NETWORK] Received discovery message from: ");
+      Serial.println(sender);
+
+      // Forward to NetworkDiscovery class if handler is registered
+      if (_discoveryHandler != NULL) {
+        Serial.println("[NETWORK] Forwarding to discovery handler");
+        _discoveryHandler->handleDiscovery(sender, mac);
+      } else {
+        Serial.println("[NETWORK] ERROR: No discovery handler registered");
+      }
       break;
 
     case MSG_TYPE_DISCOVERY_RESPONSE:
       // Add sender to peer list
       if (sender) {
-        addPeer(sender, mac);
+        Serial.print("[NETWORK] Received discovery response from: ");
+        Serial.println(sender);
+
+        // Format MAC address for debug output
+        char macStr[18];
+        sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2],
+                mac[3], mac[4], mac[5]);
+        Serial.print("[NETWORK] Response MAC: ");
+        Serial.println(macStr);
+
+        bool added = addPeer(sender, mac);
+        Serial.print("[NETWORK] Peer added from response: ");
+        Serial.println(added ? "YES" : "NO");
       }
       break;
 
@@ -439,7 +476,10 @@ bool NetworkCore::sendMessage(const char* targetBoard, uint8_t messageType,
 
 // Helper method to broadcast a message to all boards
 bool NetworkCore::broadcastMessage(uint8_t messageType, const JsonObject& doc) {
-  if (!_isConnected) return false;
+  if (!_isConnected) {
+    Serial.println("[NetworkCore] Cannot broadcast: not connected");
+    return false;
+  }
 
   // Create outgoing document
   StaticJsonDocument<384> outDoc;
@@ -464,18 +504,46 @@ bool NetworkCore::broadcastMessage(uint8_t messageType, const JsonObject& doc) {
 
   // Register broadcast address if not already registered
   if (esp_now_is_peer_exist(broadcastMac) == false) {
+    Serial.println("[NetworkCore] Registering broadcast address as peer");
     esp_now_peer_info_t peerInfo = {};
     memcpy(peerInfo.peer_addr, broadcastMac, 6);
     peerInfo.channel = 0;
     peerInfo.encrypt = false;
 
-    esp_now_add_peer(&peerInfo);
+    esp_err_t add_result = esp_now_add_peer(&peerInfo);
+    if (add_result != ESP_OK) {
+      Serial.print("[NetworkCore] Failed to add broadcast peer, error: ");
+      Serial.println(add_result);
+      return false;
+    } else {
+      Serial.println("[NetworkCore] Successfully registered broadcast address");
+    }
+  } else {
+    Serial.println("[NetworkCore] Broadcast address already registered");
   }
 
   // Send to broadcast address
+  Serial.print("[NetworkCore] Broadcasting message type ");
+  Serial.print(messageType);
+  Serial.print(", length: ");
+  Serial.println(jsonStr.length());
+
+  // For very verbose debugging, print the JSON
+  if (_verboseLoggingEnabled) {
+    Serial.print("[NetworkCore] Message content: ");
+    Serial.println(jsonStr);
+  }
+
   esp_err_t result = esp_now_send(broadcastMac, (uint8_t*)jsonStr.c_str(),
                                   jsonStr.length() + 1);
-  return (result == ESP_OK);
+  if (result != ESP_OK) {
+    Serial.print("[NetworkCore] Broadcast failed with error: ");
+    Serial.println(result);
+    return false;
+  }
+
+  Serial.println("[NetworkCore] Broadcast sent");
+  return true;
 }
 
 // Helper method to get MAC address for a board ID
@@ -668,4 +736,11 @@ void NetworkCore::verboseLog(const char* event, const char* details) {
     }
     Serial.println();
   }
+}
+
+// Add the method implementation after other onXXX methods
+bool NetworkCore::registerDiscoveryHandler(NetworkDiscovery* discovery) {
+  _discoveryHandler = discovery;
+  Serial.println("[NetworkCore] Discovery handler registered");
+  return true;
 }

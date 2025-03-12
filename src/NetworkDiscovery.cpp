@@ -60,8 +60,22 @@ bool NetworkDiscovery::broadcastPresence() {
 
   // No additional data needed for discovery broadcast
 
+  // Add debug output before broadcasting
+  Serial.print("[DISCOVERY] Broadcasting presence from board: ");
+  Serial.println(_core._boardId);
+
   // Broadcast the message using the core
-  return _core.broadcastMessage(MSG_TYPE_DISCOVERY, doc.as<JsonObject>());
+  bool result =
+      _core.broadcastMessage(MSG_TYPE_DISCOVERY, doc.as<JsonObject>());
+
+  // Log the result
+  if (result) {
+    Serial.println("[DISCOVERY] Broadcast sent successfully");
+  } else {
+    Serial.println("[DISCOVERY] Failed to send broadcast");
+  }
+
+  return result;
 }
 
 bool NetworkDiscovery::onBoardDiscovered(DiscoveryCallback callback) {
@@ -114,21 +128,44 @@ void NetworkDiscovery::handleDiscovery(const char* senderId,
                                        const uint8_t* senderMac) {
   // Don't process discovery messages from ourselves
   if (strcmp(senderId, _core._boardId) == 0) {
+    Serial.println("[DISCOVERY] Ignoring discovery from self");
     return;
   }
 
+  Serial.print("[DISCOVERY] Received discovery from board: ");
+  Serial.println(senderId);
+
+  // Format MAC address
+  char macStr[18];
+  sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X", senderMac[0], senderMac[1],
+          senderMac[2], senderMac[3], senderMac[4], senderMac[5]);
+  Serial.print("[DISCOVERY] Sender MAC: ");
+  Serial.println(macStr);
+
   // Add the sender to our peer list
   bool added = addPeer(senderId, senderMac);
+  Serial.print("[DISCOVERY] Peer added: ");
+  Serial.println(added ? "YES" : "NO");
 
   // Notify through callback if registered
   if (_discoveryCallback != NULL) {
     _discoveryCallback(senderId);
+    Serial.println("[DISCOVERY] Discovery callback executed");
+  } else {
+    Serial.println("[DISCOVERY] No discovery callback registered");
   }
 
   // Send a discovery response to let the sender know we exist
   StaticJsonDocument<128> doc;
-  _core.sendMessage(senderId, MSG_TYPE_DISCOVERY_RESPONSE,
-                    doc.as<JsonObject>());
+
+  Serial.print("[DISCOVERY] Sending discovery response to: ");
+  Serial.println(senderId);
+
+  bool sent = _core.sendMessage(senderId, MSG_TYPE_DISCOVERY_RESPONSE,
+                                doc.as<JsonObject>());
+
+  Serial.print("[DISCOVERY] Response sent: ");
+  Serial.println(sent ? "YES" : "NO");
 }
 
 bool NetworkDiscovery::addPeer(const char* boardId, const uint8_t* macAddress) {

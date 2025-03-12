@@ -14,6 +14,9 @@
 #include <WiFi.h>
 #include <esp_now.h>
 
+// Forward declaration
+class NetworkDiscovery;
+
 // Message types
 #define MSG_TYPE_PIN_CONTROL 1
 #define MSG_TYPE_PIN_SUBSCRIBE 2
@@ -113,6 +116,14 @@ class NetworkCore {
    */
   bool onSendFailure(SendFailureCallback callback);
 
+  /**
+   * Register the Discovery instance to handle discovery messages
+   *
+   * @param discovery Pointer to the NetworkDiscovery instance
+   * @return true if registered successfully
+   */
+  bool registerDiscoveryHandler(NetworkDiscovery* discovery);
+
  protected:
   // Board identification
   char _boardId[32];
@@ -181,6 +192,9 @@ class NetworkCore {
 
   // Peer management
   bool addPeer(const char* boardId, const uint8_t* macAddress);
+
+  // Discovery handler
+  NetworkDiscovery* _discoveryHandler;
 
   // Static instance pointer for callbacks
   static NetworkCore* _instance;

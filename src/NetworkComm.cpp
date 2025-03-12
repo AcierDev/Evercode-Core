@@ -26,6 +26,10 @@ bool NetworkComm::begin(const char* ssid, const char* password,
     return false;
   }
 
+  // Register discovery handler
+  _core.registerDiscoveryHandler(&_discovery);
+  Serial.println("[NetworkComm] Registered discovery handler");
+
   // Initialize all modules
   _discovery.begin();
   _pinControl.begin();
