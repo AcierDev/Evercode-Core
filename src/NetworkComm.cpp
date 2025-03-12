@@ -37,7 +37,7 @@ NetworkComm::NetworkComm() {
   _serialDataCallback = NULL;
   _discoveryCallback = NULL;  // Initialize discovery callback
   _pinControlConfirmCallback =
-      NULL;  // Initialize pin control confirmation callback
+      NULL;  // Will be deprecated in favor of per-message callbacks
   _lastDiscoveryBroadcast = 0;
   _acknowledgementsEnabled = false;
   _trackedMessageCount = 0;
@@ -56,6 +56,7 @@ NetworkComm::NetworkComm() {
   // Initialize tracked messages
   for (int i = 0; i < MAX_TRACKED_MESSAGES; i++) {
     _trackedMessages[i].active = false;
+    _trackedMessages[i].confirmCallback = NULL;
   }
 
   // Store global instance pointer for callbacks
@@ -197,21 +198,26 @@ void NetworkComm::update() {
 
           // If this was a pin control confirmation message, call the callback
           // with failure
-          if (_pinControlConfirmCallback &&
-              _trackedMessages[i].messageType == MSG_TYPE_PIN_CONTROL_CONFIRM) {
-            // Call the callback with failure
-            _pinControlConfirmCallback(_trackedMessages[i].targetBoard, 0, 0,
-                                       false);
+          if (_trackedMessages[i].messageType == MSG_TYPE_PIN_CONTROL_CONFIRM &&
+              _trackedMessages[i].confirmCallback != NULL) {
+            // Call the callback stored with this specific message with failure
+            _trackedMessages[i].confirmCallback(_trackedMessages[i].targetBoard,
+                                                0, 0, false);
+            debugLog(
+                "Calling per-message confirmCallback with failure due to "
+                "timeout");
           }
 
           // Clean up this slot
           _trackedMessages[i].active = false;
+          _trackedMessages[i].confirmCallback = NULL;
         }
         // Clean up acknowledged messages after some time
         else if (_trackedMessages[i].acknowledged &&
                  (currentTime - _trackedMessages[i].sentTime >
                   ACK_TIMEOUT * 2)) {
           _trackedMessages[i].active = false;
+          _trackedMessages[i].confirmCallback = NULL;
         }
       }
     }
@@ -255,8 +261,10 @@ void NetworkComm::broadcastPresence() {
 void NetworkComm::handleDiscovery(const char* senderId,
                                   const uint8_t* senderMac) {
   // Minimal logging
-  Serial.print("[NetworkComm] Discovery from: ");
-  Serial.println(senderId);
+  if (isDebugLoggingEnabled()) {
+    Serial.print("[NetworkComm] Discovery from: ");
+    Serial.println(senderId);
+  }
 
   // Add sender to peer list with minimal logging
   bool added = addPeer(senderId, senderMac);
@@ -288,8 +296,10 @@ bool NetworkComm::addPeer(const char* boardId, const uint8_t* macAddress) {
   }
 
   // Minimal logging for new peer
-  Serial.print("[NetworkComm] Adding peer: ");
-  Serial.println(boardId);
+  if (isDebugLoggingEnabled()) {
+    Serial.print("[NetworkComm] Adding peer: ");
+    Serial.println(boardId);
+  }
 
   // Find a free slot
   int slot = -1;
@@ -353,8 +363,10 @@ void NetworkComm::processIncomingMessage(const uint8_t* mac,
   if (len <= 0 || len > MAX_ESP_NOW_DATA_SIZE || !data || !mac) return;
 
   // Minimal logging
-  Serial.print("[NetworkComm] Received message, length: ");
-  Serial.println(len);
+  if (isVerboseLoggingEnabled()) {
+    Serial.print("[NetworkComm] Received message, length: ");
+    Serial.println(len);
+  }
 
   // Create a copy of the data with null-termination
   char* message = new char[len + 1];
@@ -387,7 +399,7 @@ void NetworkComm::processIncomingMessage(const uint8_t* mac,
   uint8_t msgType = doc["type"];
 
   // Minimal sender info logging
-  if (sender) {
+  if (isVerboseLoggingEnabled() && sender) {
     Serial.print("[NetworkComm] From: ");
     Serial.print(sender);
     Serial.print(", type: ");
@@ -435,9 +447,16 @@ void NetworkComm::processIncomingMessage(const uint8_t* mac,
           debugLog(debugMsg);
         }
 
-        // Apply the pin value
+        // Apply the pin value (directly or via callback)
         bool success = false;
-        if (pin < NUM_DIGITAL_PINS) {
+
+        // Use the global handler if it's available
+        if (_globalPinChangeCallback != NULL) {
+          _globalPinChangeCallback(sender, pin, value);
+          success = true;
+        }
+        // Otherwise fall back to direct pin control
+        else if (pin < NUM_DIGITAL_PINS) {
           pinMode(pin, OUTPUT);
           digitalWrite(pin, value);
           success = true;
@@ -480,9 +499,14 @@ void NetworkComm::processIncomingMessage(const uint8_t* mac,
             // Mark as acknowledged
             _trackedMessages[i].acknowledged = true;
 
-            // Call the callback if set
-            if (_pinControlConfirmCallback) {
-              _pinControlConfirmCallback(sender, pin, value, success);
+            // Call the callback if set for this specific message
+            if (_trackedMessages[i].confirmCallback != NULL) {
+              debugLog(
+                  "Calling per-message callback for confirmation response");
+              _trackedMessages[i].confirmCallback(sender, pin, value, success);
+
+              // Clear the callback after use
+              _trackedMessages[i].confirmCallback = NULL;
             }
 
             // Clear the tracked message
@@ -494,6 +518,67 @@ void NetworkComm::processIncomingMessage(const uint8_t* mac,
       break;
 
     case MSG_TYPE_PIN_CONTROL:
+      if (sender && doc.containsKey("pin") && doc.containsKey("value")) {
+        uint8_t pin = doc["pin"];
+        uint8_t value = doc["value"];
+
+        // Debug logging for pin control messages
+        if (_debugLoggingEnabled) {
+          char debugMsg[100];
+          sprintf(debugMsg, "Received pin control from %s: pin=%d, value=%d",
+                  sender, pin, value);
+          debugLog(debugMsg);
+        }
+
+        // Check if message has a messageId for callback tracking
+        if (doc.containsKey("messageId") && _acknowledgementsEnabled) {
+          const char* messageId = doc["messageId"];
+          // Send acknowledgement
+          sendAcknowledgement(sender, messageId);
+        }
+
+        bool pinHandled = false;
+
+        // Call the global handler if it's set
+        if (_globalPinChangeCallback != NULL) {
+          _globalPinChangeCallback(sender, pin, value);
+          pinHandled = true;
+        }
+
+        // Also process pin subscriptions for backwards compatibility
+        for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
+          if (_subscriptions[i].active &&
+              _subscriptions[i].type == MSG_TYPE_PIN_SUBSCRIBE &&
+              strcmp(_subscriptions[i].targetBoard, sender) == 0 &&
+              _subscriptions[i].pin == pin) {
+            PinChangeCallback callback =
+                (PinChangeCallback)_subscriptions[i].callback;
+            if (callback) {
+              if (_debugLoggingEnabled) {
+                debugLog("Executing pin change callback (subscription)");
+              }
+              callback(sender, pin, value);
+              pinHandled = true;
+            }
+          }
+        }
+
+        // If no callback handled this pin, do it directly
+        if (!pinHandled && pin < NUM_DIGITAL_PINS) {
+          if (_debugLoggingEnabled) {
+            debugLog("No callback found, setting pin directly");
+          }
+          pinMode(pin, OUTPUT);
+          digitalWrite(pin, value);
+        }
+      } else {
+        if (_debugLoggingEnabled) {
+          debugLog(
+              "Received malformed pin message (missing sender, pin, or value)");
+        }
+      }
+      break;
+
     case MSG_TYPE_PIN_PUBLISH:
       if (sender && doc.containsKey("pin") && doc.containsKey("value")) {
         uint8_t pin = doc["pin"];
@@ -503,12 +588,19 @@ void NetworkComm::processIncomingMessage(const uint8_t* mac,
         if (_debugLoggingEnabled) {
           char debugMsg[100];
           sprintf(debugMsg, "Received pin %s from %s: pin=%d, value=%d",
-                  (msgType == MSG_TYPE_PIN_CONTROL) ? "control" : "publish",
-                  sender, pin, value);
+                  "publish", sender, pin, value);
           debugLog(debugMsg);
         }
 
-        // Process pin subscriptions
+        bool pinHandled = false;
+
+        // Call the global handler if it's set
+        if (_globalPinChangeCallback != NULL) {
+          _globalPinChangeCallback(sender, pin, value);
+          pinHandled = true;
+        }
+
+        // Process pin subscriptions for backwards compatibility
         for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
           if (_subscriptions[i].active &&
               _subscriptions[i].type == MSG_TYPE_PIN_SUBSCRIBE &&
@@ -521,8 +613,18 @@ void NetworkComm::processIncomingMessage(const uint8_t* mac,
                 debugLog("Executing pin change callback");
               }
               callback(sender, pin, value);
+              pinHandled = true;
             }
           }
+        }
+
+        // If no callback handled this pin, do it directly
+        if (!pinHandled && pin < NUM_DIGITAL_PINS) {
+          if (_debugLoggingEnabled) {
+            debugLog("No callback found for publish, setting pin directly");
+          }
+          pinMode(pin, OUTPUT);
+          digitalWrite(pin, value);
         }
       } else {
         if (_debugLoggingEnabled) {
@@ -702,67 +804,144 @@ String NetworkComm::getAvailableBoardName(int index) {
 // ==================== Remote Pin Control (Controller Side)
 // ====================
 
-// Set pin value on remote board (old name: setPinValue)
+// Unified remote pin control method with optional callback and confirmation
 bool NetworkComm::controlRemotePin(const char* targetBoardId, uint8_t pin,
-                                   uint8_t value) {
+                                   uint8_t value,
+                                   PinControlConfirmCallback callback,
+                                   bool requireConfirmation) {
   if (!_isConnected) return false;
 
   char debugMsg[100];
-  sprintf(debugMsg, "board %s, pin %d, value %d", targetBoardId, pin, value);
+  sprintf(debugMsg, "board %s, pin %d, value %d, confirm %s", targetBoardId,
+          pin, value, requireConfirmation ? "yes" : "no");
   debugLog("Controlling remote pin", debugMsg);
 
-  DynamicJsonDocument doc(64);
-  doc["pin"] = pin;
-  doc["value"] = value;
+  // If confirmation is required, use the confirmation protocol
+  if (requireConfirmation) {
+    // Generate a message ID for tracking
+    char messageId[37];
+    generateMessageId(messageId);
 
-  return sendMessage(targetBoardId, MSG_TYPE_PIN_CONTROL, doc.as<JsonObject>());
+    // Track this message for confirmation
+    int messageSlot = -1;
+    for (int i = 0; i < MAX_TRACKED_MESSAGES; i++) {
+      if (!_trackedMessages[i].active) {
+        messageSlot = i;
+        strcpy(_trackedMessages[i].messageId, messageId);
+        strcpy(_trackedMessages[i].targetBoard, targetBoardId);
+        _trackedMessages[i].acknowledged = false;
+        _trackedMessages[i].sentTime = millis();
+        _trackedMessages[i].active = true;
+        _trackedMessages[i].messageType = MSG_TYPE_PIN_CONTROL_CONFIRM;
+        _trackedMessages[i].confirmCallback =
+            callback;  // Store callback with this specific message
+        debugLog("Stored callback with message", messageId);
+        break;
+      }
+    }
+
+    // If we couldn't find a message slot, return false
+    if (messageSlot == -1) {
+      debugLog("No message slots available for confirmation tracking");
+      return false;
+    }
+
+    // Prepare the message
+    DynamicJsonDocument doc(64);
+    doc["pin"] = pin;
+    doc["value"] = value;
+    doc["messageId"] = messageId;
+
+    return sendMessage(targetBoardId, MSG_TYPE_PIN_CONTROL_CONFIRM,
+                       doc.as<JsonObject>());
+  }
+  // No confirmation required
+  else {
+    DynamicJsonDocument doc(64);
+    doc["pin"] = pin;
+    doc["value"] = value;
+
+    // If a callback was provided, generate a message ID and track it
+    if (callback != NULL) {
+      char messageId[37];
+      generateMessageId(messageId);
+      doc["messageId"] = messageId;
+
+      // Find a tracking slot
+      for (int i = 0; i < MAX_TRACKED_MESSAGES; i++) {
+        if (!_trackedMessages[i].active) {
+          strcpy(_trackedMessages[i].messageId, messageId);
+          strcpy(_trackedMessages[i].targetBoard, targetBoardId);
+          _trackedMessages[i].acknowledged = false;
+          _trackedMessages[i].sentTime = millis();
+          _trackedMessages[i].active = true;
+          _trackedMessages[i].messageType = MSG_TYPE_PIN_CONTROL;
+          _trackedMessages[i].confirmCallback = callback;
+          break;
+        }
+      }
+    }
+
+    return sendMessage(targetBoardId, MSG_TYPE_PIN_CONTROL,
+                       doc.as<JsonObject>());
+  }
 }
 
-// Set pin value on remote board with confirmation (old name:
-// setPinValueWithConfirmation)
-bool NetworkComm::controlRemotePinWithConfirmation(
-    const char* targetBoardId, uint8_t pin, uint8_t value,
-    PinControlConfirmCallback callback) {
+// Global pin change callback to handle all pin control messages
+PinChangeCallback _globalPinChangeCallback = NULL;
+
+// Unified approach to handle pin control requests
+bool NetworkComm::handlePinControl(PinChangeCallback callback) {
   if (!_isConnected) return false;
 
-  char debugMsg[100];
-  sprintf(debugMsg, "board %s, pin %d, value %d (with confirmation)",
-          targetBoardId, pin, value);
-  debugLog("Controlling remote pin", debugMsg);
+  if (callback == NULL) {
+    debugLog("Setting up automatic pin control (no callback)");
+  } else {
+    debugLog("Setting up pin control with custom callback");
+  }
 
-  // Store the callback for later use
-  _pinControlConfirmCallback = callback;
+  // Store the global callback (which may be NULL)
+  _globalPinChangeCallback = callback;
 
-  DynamicJsonDocument doc(64);
-  doc["pin"] = pin;
-  doc["value"] = value;
+  return true;
+}
 
-  // Generate a message ID for tracking
-  char messageId[37];
-  generateMessageId(messageId);
-  doc["messageId"] = messageId;
+// Stop handling pin control requests
+bool NetworkComm::stopHandlingPinControl() {
+  debugLog("Stopping unified pin control handler");
 
-  // Track this message for confirmation
-  for (int i = 0; i < MAX_TRACKED_MESSAGES; i++) {
-    if (!_trackedMessages[i].active) {
-      strcpy(_trackedMessages[i].messageId, messageId);
-      strcpy(_trackedMessages[i].targetBoard, targetBoardId);
-      _trackedMessages[i].acknowledged = false;
-      _trackedMessages[i].sentTime = millis();
-      _trackedMessages[i].active = true;
-      break;
+  // Clear the global callback
+  _globalPinChangeCallback = NULL;
+
+  // Clear all pin control subscriptions
+  for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
+    if (_subscriptions[i].active &&
+        (_subscriptions[i].type == MSG_TYPE_PIN_SUBSCRIBE ||
+         _subscriptions[i].type == MSG_TYPE_PIN_CONTROL)) {
+      _subscriptions[i].active = false;
     }
   }
 
-  return sendMessage(targetBoardId, MSG_TYPE_PIN_CONTROL_CONFIRM,
-                     doc.as<JsonObject>());
+  return true;
 }
 
 // Clear the pin control confirmation callback (old name:
 // clearPinControlConfirmCallback)
 bool NetworkComm::clearRemotePinConfirmCallback() {
-  debugLog("Clearing pin control confirmation callback");
+  debugLog("Clearing all pin control confirmation callbacks");
+
+  // Clear the deprecated global callback
   _pinControlConfirmCallback = NULL;
+
+  // Also clear all per-message callbacks
+  for (int i = 0; i < MAX_TRACKED_MESSAGES; i++) {
+    if (_trackedMessages[i].active &&
+        (_trackedMessages[i].messageType == MSG_TYPE_PIN_CONTROL_CONFIRM ||
+         _trackedMessages[i].messageType == MSG_TYPE_PIN_CONTROL)) {
+      _trackedMessages[i].confirmCallback = NULL;
+    }
+  }
+
   return true;
 }
 
@@ -1094,6 +1273,18 @@ bool NetworkComm::enableDebugLogging(bool enable) {
 
 // Check if debug logging is enabled (existing method, unchanged)
 bool NetworkComm::isDebugLoggingEnabled() { return _debugLoggingEnabled; }
+
+// Enable or disable verbose logging (existing method, unchanged)
+bool NetworkComm::enableVerboseLogging(bool enable) {
+  _verboseLoggingEnabled = enable;
+  char debugMsg[50];
+  sprintf(debugMsg, "Verbose logging %s", enable ? "enabled" : "disabled");
+  debugLog(debugMsg);
+  return true;
+}
+
+// Check if verbose logging is enabled (existing method, unchanged)
+bool NetworkComm::isVerboseLoggingEnabled() { return _verboseLoggingEnabled; }
 
 // Generate a simple UUID-like message ID
 void NetworkComm::generateMessageId(char* buffer) {

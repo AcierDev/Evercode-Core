@@ -1,6 +1,6 @@
 {
   "name": "Evercode-Core",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "A lightweight library for communication between ESP32 boards on the same network",
   "keywords": "communication, network, mqtt, mdns, esp32",
   "repository": {
