@@ -48,6 +48,11 @@
 #define ACK_TIMEOUT 5000                  // 5 seconds
 #define PIN_CONTROL_CONFIRM_TIMEOUT 5000  // 5 seconds
 
+// Retry settings
+#define DEFAULT_MAX_RETRIES 3    // Default maximum number of retries
+#define DEFAULT_RETRY_DELAY 500  // Default delay between retries (ms)
+#define MAX_RETRY_DELAY 10000    // Maximum allowed retry delay (ms)
+
 // Callback function types
 typedef void (*MessageCallback)(const char* sender, const char* topic,
                                 const char* message);
@@ -212,6 +217,62 @@ class NetworkComm {
    */
   bool onSendFailure(SendFailureCallback callback);
 
+  /**
+   * Enable or disable automatic retries for pin control messages
+   *
+   * When enabled, pin control messages that fail to deliver will be
+   * automatically retried up to the configured maximum number of retries.
+   * This works for all pin control messages, regardless of whether a
+   * callback was provided.
+   *
+   * @param enable true to enable automatic retries, false to disable
+   * @return true if the setting was applied successfully
+   */
+  bool enablePinControlRetries(bool enable);
+
+  /**
+   * Check if automatic retries are enabled
+   *
+   * @return true if automatic retries are enabled, false otherwise
+   */
+  bool isPinControlRetriesEnabled();
+
+  /**
+   * Configure the maximum number of retries for pin control messages
+   *
+   * This setting affects all pin control messages when retries are enabled,
+   * whether or not they have callbacks registered.
+   *
+   * @param maxRetries The maximum number of retries (0-10)
+   * @return true if the setting was applied successfully
+   */
+  bool setPinControlMaxRetries(uint8_t maxRetries);
+
+  /**
+   * Get the current maximum number of retries for pin control messages
+   *
+   * @return The maximum number of retries
+   */
+  uint8_t getPinControlMaxRetries();
+
+  /**
+   * Configure the delay between retries for pin control messages
+   *
+   * This setting affects all pin control messages when retries are enabled,
+   * whether or not they have callbacks registered.
+   *
+   * @param retryDelayMs The delay between retries in milliseconds (50-10000)
+   * @return true if the setting was applied successfully
+   */
+  bool setPinControlRetryDelay(uint16_t retryDelayMs);
+
+  /**
+   * Get the current delay between retries for pin control messages
+   *
+   * @return The delay between retries in milliseconds
+   */
+  uint16_t getPinControlRetryDelay();
+
   // ==================== Remote Pin Control (Controller Side)
   // ====================
   /**
@@ -229,6 +290,10 @@ class NetworkComm {
    *
    * - controlRemotePin("boardA", 13, HIGH, myCallback)
    *   Callback triggered when message is delivered or fails
+   *
+   * Note: If auto-retries are enabled (using enablePinControlRetries),
+   * they will work for all pin control messages, even when no callback is
+   * provided.
    */
   bool controlRemotePin(const char* targetBoardId, uint8_t pin, uint8_t value,
                         PinControlConfirmCallback callback = NULL);
@@ -464,6 +529,9 @@ class NetworkComm {
   bool _acknowledgementsEnabled;
   bool _debugLoggingEnabled;
   bool _verboseLoggingEnabled;
+  bool _pinControlRetriesEnabled;
+  uint8_t _pinControlMaxRetries;
+  uint16_t _pinControlRetryDelay;
 
   // Message tracking for acknowledgements
   static const int MAX_TRACKED_MESSAGES = 10;
@@ -480,6 +548,10 @@ class NetworkComm {
     // Store pin control data for callbacks
     uint8_t pin;
     uint8_t value;
+    // Retry-related fields
+    uint8_t retryCount;
+    uint32_t nextRetryTime;
+    bool retryScheduled;
   };
 
   MessageTrack _trackedMessages[MAX_TRACKED_MESSAGES];

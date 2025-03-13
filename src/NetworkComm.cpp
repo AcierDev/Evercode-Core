@@ -45,10 +45,13 @@ NetworkComm::NetworkComm() {
   _lastDiscoveryBroadcast = 0;
   _acknowledgementsEnabled = false;
   _trackedMessageCount = 0;
-  _debugLoggingEnabled = false;  // Debug logging off by default
-  _sendStatusCallback = NULL;    // Initialize send status callback
-  _sendFailureCallback = NULL;   // Initialize send failure callback
-  _queuedResponseCount = 0;      // Initialize queued response count
+  _debugLoggingEnabled = false;       // Debug logging off by default
+  _sendStatusCallback = NULL;         // Initialize send status callback
+  _sendFailureCallback = NULL;        // Initialize send failure callback
+  _queuedResponseCount = 0;           // Initialize queued response count
+  _pinControlRetriesEnabled = false;  // Automatic retries disabled by default
+  _pinControlMaxRetries = DEFAULT_MAX_RETRIES;  // Default max retries
+  _pinControlRetryDelay = DEFAULT_RETRY_DELAY;  // Default retry delay
 
   // Initialize subscriptions
   for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
@@ -66,6 +69,9 @@ NetworkComm::NetworkComm() {
     _trackedMessages[i].confirmCallback = NULL;
     _trackedMessages[i].pin = 0;
     _trackedMessages[i].value = 0;
+    _trackedMessages[i].retryCount = 0;
+    _trackedMessages[i].nextRetryTime = 0;
+    _trackedMessages[i].retryScheduled = false;
   }
 
   // Initialize queued responses
@@ -215,6 +221,38 @@ void NetworkComm::update() {
   // acknowledgements to ensure timely delivery
   processQueuedResponses();
 
+  // Process scheduled retries for pin control messages
+  if (_pinControlRetriesEnabled) {
+    for (int i = 0; i < MAX_TRACKED_MESSAGES; i++) {
+      if (_trackedMessages[i].active && _trackedMessages[i].retryScheduled &&
+          _trackedMessages[i].messageType == MSG_TYPE_PIN_CONTROL &&
+          currentTime >= _trackedMessages[i].nextRetryTime) {
+        // Time to retry this message
+        _trackedMessages[i].retryScheduled = false;
+
+        if (_debugLoggingEnabled) {
+          char debugMsg[100];
+          sprintf(
+              debugMsg,
+              "Retrying pin control to %s (pin %d, value %d) - attempt %d/%d",
+              _trackedMessages[i].targetBoard, _trackedMessages[i].pin,
+              _trackedMessages[i].value, _trackedMessages[i].retryCount,
+              _pinControlMaxRetries);
+          debugLog(debugMsg);
+        }
+
+        // Create a new message with the same content
+        DynamicJsonDocument doc(64);
+        doc["pin"] = _trackedMessages[i].pin;
+        doc["value"] = _trackedMessages[i].value;
+
+        // Send the retry message
+        sendMessage(_trackedMessages[i].targetBoard, MSG_TYPE_PIN_CONTROL,
+                    doc.as<JsonObject>());
+      }
+    }
+  }
+
   // Process message acknowledgements if enabled
   if (_acknowledgementsEnabled) {
     // Check for message timeouts
@@ -229,15 +267,26 @@ void NetworkComm::update() {
                   _trackedMessages[i].targetBoard);
           debugLog(debugMsg);
 
-          // If this was a pin control message, call the callback with failure
-          if (_trackedMessages[i].messageType == MSG_TYPE_PIN_CONTROL &&
-              _trackedMessages[i].confirmCallback != NULL) {
-            // Call the callback stored with this specific message with failure
-            _trackedMessages[i].confirmCallback(_trackedMessages[i].targetBoard,
-                                                0, 0, false);
-            debugLog(
-                "Calling per-message confirmCallback with failure due to "
-                "timeout");
+          // If this was a pin control message with a callback, call the
+          // callback with failure
+          if (_trackedMessages[i].messageType == MSG_TYPE_PIN_CONTROL) {
+            if (_trackedMessages[i].confirmCallback != NULL) {
+              // Call the callback stored with this specific message with
+              // failure
+              _trackedMessages[i].confirmCallback(
+                  _trackedMessages[i].targetBoard, 0, 0, false);
+              debugLog(
+                  "Calling per-message confirmCallback with failure due to "
+                  "timeout");
+            } else {
+              debugLog(
+                  "Pin control message timed out but no callback was "
+                  "registered");
+            }
+
+            // Always clean up the slot regardless of callback
+            _trackedMessages[i].active = false;
+            _trackedMessages[i].confirmCallback = NULL;
           }
           // If this was a pin read request, call the callback with failure
           else if (_trackedMessages[i].messageType ==
@@ -251,11 +300,15 @@ void NetworkComm::update() {
             debugLog(
                 "Calling pin read response callback with failure due to "
                 "timeout");
-          }
 
-          // Clean up this slot
-          _trackedMessages[i].active = false;
-          _trackedMessages[i].confirmCallback = NULL;
+            // Clean up this slot
+            _trackedMessages[i].active = false;
+            _trackedMessages[i].confirmCallback = NULL;
+          } else {
+            // Clean up this slot for other message types
+            _trackedMessages[i].active = false;
+            _trackedMessages[i].confirmCallback = NULL;
+          }
         }
         // Clean up acknowledged messages after some time
         else if (_trackedMessages[i].acknowledged &&
@@ -528,9 +581,6 @@ void NetworkComm::processIncomingMessage(const uint8_t* mac,
         } else if (pin < NUM_DIGITAL_PINS) {
           // Default: use digitalRead if pin is valid
           pinMode(pin, INPUT_PULLUP);  // Set pin to input mode
-          Serial.println("Reading pin");
-          Serial.println(pin);
-          Serial.println(digitalRead(pin));
           value = digitalRead(pin);
         } else {
           // Invalid pin
@@ -939,27 +989,34 @@ bool NetworkComm::controlRemotePin(const char* targetBoardId, uint8_t pin,
   doc["pin"] = pin;
   doc["value"] = value;
 
-  // Generate a message ID for tracking if a callback was provided
-  if (callback != NULL) {
-    char messageId[37];
-    generateMessageId(messageId);
-    doc["messageId"] = messageId;
+  // Always generate a message ID for tracking, regardless of callback
+  char messageId[37];
+  generateMessageId(messageId);
+  doc["messageId"] = messageId;
 
-    // Track this message for callback
-    for (int i = 0; i < MAX_TRACKED_MESSAGES; i++) {
-      if (!_trackedMessages[i].active) {
-        strcpy(_trackedMessages[i].messageId, messageId);
-        strcpy(_trackedMessages[i].targetBoard, targetBoardId);
-        _trackedMessages[i].acknowledged = false;
-        _trackedMessages[i].sentTime = millis();
-        _trackedMessages[i].active = true;
-        _trackedMessages[i].messageType = MSG_TYPE_PIN_CONTROL;
-        _trackedMessages[i].confirmCallback = callback;
-        _trackedMessages[i].pin = pin;
-        _trackedMessages[i].value = value;
+  // Always track this message for retry purposes
+  for (int i = 0; i < MAX_TRACKED_MESSAGES; i++) {
+    if (!_trackedMessages[i].active) {
+      strcpy(_trackedMessages[i].messageId, messageId);
+      strcpy(_trackedMessages[i].targetBoard, targetBoardId);
+      _trackedMessages[i].acknowledged = false;
+      _trackedMessages[i].sentTime = millis();
+      _trackedMessages[i].active = true;
+      _trackedMessages[i].messageType = MSG_TYPE_PIN_CONTROL;
+      _trackedMessages[i].confirmCallback = callback;  // May be NULL
+      _trackedMessages[i].pin = pin;
+      _trackedMessages[i].value = value;
+      // Initialize retry-related fields
+      _trackedMessages[i].retryCount = 0;
+      _trackedMessages[i].nextRetryTime = 0;
+      _trackedMessages[i].retryScheduled = false;
+
+      if (callback != NULL) {
         debugLog("Stored callback with message", messageId);
-        break;
+      } else {
+        debugLog("Tracking message for auto-retries (no callback)", messageId);
       }
+      break;
     }
   }
 
@@ -1157,22 +1214,70 @@ void NetworkComm::handleSendStatus(const uint8_t* mac_addr,
 
         if (macMatch) {
           // Found a matching message
-          _trackedMessages[i].acknowledged = isSuccess;
           messageType = _trackedMessages[i].messageType;
           pin = _trackedMessages[i].pin;
           value = _trackedMessages[i].value;
 
-          // If this is a pin control message with a callback, call it
-          if (_trackedMessages[i].confirmCallback != NULL &&
-              _trackedMessages[i].messageType == MSG_TYPE_PIN_CONTROL) {
-            _trackedMessages[i].confirmCallback(
-                _trackedMessages[i].targetBoard, _trackedMessages[i].pin,
-                _trackedMessages[i].value, isSuccess);
+          if (isSuccess) {
+            // Message was sent successfully
+            _trackedMessages[i].acknowledged = true;
 
-            // Clean up the tracked message if it succeeded
-            if (isSuccess) {
+            // If this is a pin control message with a callback, call it
+            if (_trackedMessages[i].confirmCallback != NULL &&
+                _trackedMessages[i].messageType == MSG_TYPE_PIN_CONTROL) {
+              _trackedMessages[i].confirmCallback(
+                  _trackedMessages[i].targetBoard, _trackedMessages[i].pin,
+                  _trackedMessages[i].value, true);
+
+              // Clean up the tracked message
               _trackedMessages[i].active = false;
               _trackedMessages[i].confirmCallback = NULL;
+            }
+            // If no callback but we've successfully sent the message, we can
+            // clean up
+            else if (_trackedMessages[i].messageType == MSG_TYPE_PIN_CONTROL) {
+              _trackedMessages[i].active = false;
+            }
+          } else {
+            // Message failed to send
+
+            // Check if we should retry this message
+            if (_pinControlRetriesEnabled &&
+                _trackedMessages[i].messageType == MSG_TYPE_PIN_CONTROL &&
+                _trackedMessages[i].retryCount < _pinControlMaxRetries) {
+              // Schedule a retry
+              _trackedMessages[i].retryCount++;
+              _trackedMessages[i].nextRetryTime =
+                  millis() + _pinControlRetryDelay;
+              _trackedMessages[i].retryScheduled = true;
+
+              if (_debugLoggingEnabled) {
+                char debugMsg[100];
+                sprintf(debugMsg,
+                        "Scheduling retry %d/%d for pin control to %s (pin %d) "
+                        "in %d ms",
+                        _trackedMessages[i].retryCount, _pinControlMaxRetries,
+                        _trackedMessages[i].targetBoard,
+                        _trackedMessages[i].pin, _pinControlRetryDelay);
+                debugLog(debugMsg);
+              }
+            } else {
+              // No more retries or retries disabled
+
+              // If there's a callback, call it with failure
+              if (_trackedMessages[i].confirmCallback != NULL &&
+                  _trackedMessages[i].messageType == MSG_TYPE_PIN_CONTROL) {
+                _trackedMessages[i].confirmCallback(
+                    _trackedMessages[i].targetBoard, _trackedMessages[i].pin,
+                    _trackedMessages[i].value, false);
+              }
+
+              // Always clean up the tracked message after max retries or when
+              // retries are disabled
+              if (_trackedMessages[i].messageType == MSG_TYPE_PIN_CONTROL) {
+                _trackedMessages[i].active = false;
+                _trackedMessages[i].confirmCallback = NULL;
+              }
             }
           }
 
@@ -1740,4 +1845,55 @@ void NetworkComm::processQueuedResponses() {
       }
     }
   }
+}
+
+// Enable or disable automatic retries for pin control messages
+bool NetworkComm::enablePinControlRetries(bool enable) {
+  _pinControlRetriesEnabled = enable;
+  char debugMsg[50];
+  sprintf(debugMsg, "Pin control retries %s", enable ? "enabled" : "disabled");
+  debugLog(debugMsg);
+  return true;
+}
+
+// Check if automatic retries are enabled
+bool NetworkComm::isPinControlRetriesEnabled() {
+  return _pinControlRetriesEnabled;
+}
+
+// Configure the maximum number of retries for pin control messages
+bool NetworkComm::setPinControlMaxRetries(uint8_t maxRetries) {
+  // Limit to a reasonable range (0-10)
+  if (maxRetries > 10) {
+    maxRetries = 10;
+  }
+
+  _pinControlMaxRetries = maxRetries;
+
+  char debugMsg[50];
+  sprintf(debugMsg, "Pin control max retries set to %d", maxRetries);
+  debugLog(debugMsg);
+
+  return true;
+}
+
+// Get the current maximum number of retries for pin control messages
+uint8_t NetworkComm::getPinControlMaxRetries() { return _pinControlMaxRetries; }
+
+// Configure the delay between retries for pin control messages
+bool NetworkComm::setPinControlRetryDelay(uint16_t retryDelayMs) {
+  // Enforce minimum and maximum delay values
+  if (retryDelayMs < 50) {
+    retryDelayMs = 50;  // Minimum 50ms to avoid flooding
+  } else if (retryDelayMs > MAX_RETRY_DELAY) {
+    retryDelayMs = MAX_RETRY_DELAY;  // Maximum 10 seconds
+  }
+
+  _pinControlRetryDelay = retryDelayMs;
+
+  char debugMsg[50];
+  sprintf(debugMsg, "Pin control retry delay set to %d ms", retryDelayMs);
+  debugLog(debugMsg);
+
+  return true;
 }
