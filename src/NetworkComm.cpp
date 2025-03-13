@@ -13,7 +13,7 @@ static NetworkComm* _instance = nullptr;
 PinChangeCallback _globalPinChangeCallback = NULL;
 
 // Debug function for consistent debug output formatting
-void debugLog(const char* event, const char* details = nullptr) {
+static void debugLog(const char* event, const char* details = nullptr) {
   // Only log if debugging is enabled in the NetworkComm instance
   if (_instance && _instance->isDebugLoggingEnabled()) {
     Serial.print("[NetworkComm] ");
