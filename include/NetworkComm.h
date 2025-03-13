@@ -32,11 +32,15 @@
 #define MSG_TYPE_DISCOVERY 7
 #define MSG_TYPE_DISCOVERY_RESPONSE 8
 #define MSG_TYPE_ACKNOWLEDGEMENT 9
+#define MSG_TYPE_PIN_READ_REQUEST 10
+#define MSG_TYPE_PIN_READ_RESPONSE 11
 
 // Maximum number of subscriptions
 #define MAX_SUBSCRIPTIONS 20
 // Maximum number of peer boards
 #define MAX_PEERS 20
+// Maximum number of queued pin read responses
+#define MAX_QUEUED_RESPONSES 10
 // Maximum ESP-NOW data size
 #define MAX_ESP_NOW_DATA_SIZE 250
 
@@ -60,6 +64,9 @@ typedef void (*SendStatusCallback)(const char* targetBoardId,
 typedef void (*SendFailureCallback)(const char* targetBoardId,
                                     uint8_t messageType, uint8_t pin,
                                     uint8_t value);
+// New callback type for pin read responses
+typedef void (*PinReadResponseCallback)(const char* sender, uint8_t pin,
+                                        uint8_t value, bool success);
 
 class NetworkComm {
  public:
@@ -257,14 +264,30 @@ class NetworkComm {
   /**
    * Read the value of a pin on a remote board
    *
-   * Note: This method is not fully implemented and always returns 0.
-   * A proper implementation would require a request/response pattern.
+   * This method sends a request to read a pin on a remote board and provides
+   * the result through a callback. Since ESP-NOW communication is asynchronous,
+   * the pin value cannot be returned directly.
    *
    * @param targetBoardId The ID of the target board
    * @param pin The pin number to read
-   * @return The pin value (currently always returns 0)
+   * @param callback Function to call when the pin value is received or times
+   * out
+   * @return true if the request was sent successfully, false otherwise
    */
-  uint8_t readRemotePin(const char* targetBoardId, uint8_t pin);
+  bool readRemotePin(const char* targetBoardId, uint8_t pin,
+                     PinReadResponseCallback callback);
+
+  /**
+   * Read the value of a pin on a remote board synchronously
+   *
+   * This method sends a request to read a pin on a remote board and returns the
+   * result immediately.
+   *
+   * @param targetBoardId The ID of the target board
+   * @param pin The pin number to read
+   * @return The pin value
+   */
+  uint8_t readRemotePinSync(const char* targetBoardId, uint8_t pin);
 
   // ==================== Remote Pin Control (Responder Side)
   // ====================
@@ -308,6 +331,26 @@ class NetworkComm {
    * @return true if the subscription was removed successfully
    */
   bool stopAcceptingPinControlFrom(const char* controllerBoardId, uint8_t pin);
+
+  /**
+   * Handle pin read requests from other boards
+   *
+   * When this is set up, the board will respond to pin read requests by reading
+   * the requested pin value and sending it back to the requester.
+   *
+   * @param callback Optional callback to handle pin read requests. If NULL
+   * (default), the library will automatically read pins using digitalRead(). If
+   * provided, your callback must return the pin value to send back.
+   * @return true if successful
+   */
+  bool handlePinReadRequests(uint8_t (*pinReadCallback)(uint8_t pin) = NULL);
+
+  /**
+   * Stop handling pin read requests
+   *
+   * @return true if successful
+   */
+  bool stopHandlingPinReadRequests();
 
   // ==================== Pin State Broadcasting ====================
   /**
@@ -589,6 +632,8 @@ class NetworkComm {
   SerialDataCallback _serialDataCallback;
   DiscoveryCallback _discoveryCallback;
   PinControlConfirmCallback _pinControlConfirmCallback;
+  uint8_t (*_pinReadCallback)(
+      uint8_t pin);  // Callback for handling pin read requests
 
   // Internal helper functions
   uint32_t _lastDiscoveryBroadcast;
@@ -599,6 +644,28 @@ class NetworkComm {
    * Sends discovery messages and processes discovery responses.
    */
   void performDiscovery();
+
+  // Structure for pin read responses queue
+  struct PinReadResponse {
+    char targetBoard[32];
+    uint8_t pin;
+    uint8_t value;
+    bool success;
+    char messageId[37];
+    bool active;
+    uint32_t queuedTime;
+  };
+
+  // Queue for pin read responses
+  PinReadResponse _queuedResponses[MAX_QUEUED_RESPONSES];
+  uint8_t _queuedResponseCount;
+
+  // Method to queue a pin read response
+  void queuePinReadResponse(const char* targetBoard, uint8_t pin, uint8_t value,
+                            bool success, const char* messageId);
+
+  // Method to process the queued responses
+  void processQueuedResponses();
 };
 
 #endif

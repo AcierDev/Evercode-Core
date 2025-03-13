@@ -41,12 +41,14 @@ NetworkComm::NetworkComm() {
   _discoveryCallback = NULL;  // Initialize discovery callback
   _pinControlConfirmCallback =
       NULL;  // Legacy callback maintained for backward compatibility
+  _pinReadCallback = NULL;  // Initialize pin read callback
   _lastDiscoveryBroadcast = 0;
   _acknowledgementsEnabled = false;
   _trackedMessageCount = 0;
   _debugLoggingEnabled = false;  // Debug logging off by default
   _sendStatusCallback = NULL;    // Initialize send status callback
   _sendFailureCallback = NULL;   // Initialize send failure callback
+  _queuedResponseCount = 0;      // Initialize queued response count
 
   // Initialize subscriptions
   for (int i = 0; i < MAX_SUBSCRIPTIONS; i++) {
@@ -64,6 +66,11 @@ NetworkComm::NetworkComm() {
     _trackedMessages[i].confirmCallback = NULL;
     _trackedMessages[i].pin = 0;
     _trackedMessages[i].value = 0;
+  }
+
+  // Initialize queued responses
+  for (int i = 0; i < MAX_QUEUED_RESPONSES; i++) {
+    _queuedResponses[i].active = false;
   }
 
   // Store global instance pointer for callbacks
@@ -204,6 +211,10 @@ void NetworkComm::update() {
     _lastDiscoveryBroadcast = currentTime;
   }
 
+  // Process queued pin read responses - should be processed before
+  // acknowledgements to ensure timely delivery
+  processQueuedResponses();
+
   // Process message acknowledgements if enabled
   if (_acknowledgementsEnabled) {
     // Check for message timeouts
@@ -226,6 +237,19 @@ void NetworkComm::update() {
                                                 0, 0, false);
             debugLog(
                 "Calling per-message confirmCallback with failure due to "
+                "timeout");
+          }
+          // If this was a pin read request, call the callback with failure
+          else if (_trackedMessages[i].messageType ==
+                       MSG_TYPE_PIN_READ_REQUEST &&
+                   _trackedMessages[i].confirmCallback != NULL) {
+            // Call the callback stored with this specific message with failure
+            PinReadResponseCallback callback =
+                (PinReadResponseCallback)_trackedMessages[i].confirmCallback;
+            callback(_trackedMessages[i].targetBoard, _trackedMessages[i].pin,
+                     0, false);
+            debugLog(
+                "Calling pin read response callback with failure due to "
                 "timeout");
           }
 
@@ -281,22 +305,46 @@ void NetworkComm::broadcastPresence() {
 // Handle discovery message
 void NetworkComm::handleDiscovery(const char* senderId,
                                   const uint8_t* senderMac) {
-  // Minimal logging
-  if (isDebugLoggingEnabled()) {
-    Serial.print("[NetworkComm] Discovery from: ");
-    Serial.println(senderId);
+  // Always log discovery messages
+  Serial.print("[NetworkComm] Discovery from: ");
+  Serial.println(senderId);
+
+  // Always refresh the MAC address when a discovery message is received
+  bool peerExists = false;
+  for (int i = 0; i < MAX_PEERS; i++) {
+    if (_peers[i].active && strcmp(_peers[i].boardId, senderId) == 0) {
+      // Update the MAC address to ensure it's current
+      memcpy(_peers[i].macAddress, senderMac, 6);
+      _peers[i].lastSeen = millis();
+      peerExists = true;
+
+      // Re-register with ESP-NOW to update any stale entries
+      esp_now_peer_info_t peerInfo = {};
+      memcpy(peerInfo.peer_addr, senderMac, 6);
+      peerInfo.channel = 0;
+      peerInfo.encrypt = false;
+
+      // Remove if exists with different configuration
+      esp_now_del_peer(senderMac);
+
+      // Add with current configuration
+      esp_now_add_peer(&peerInfo);
+
+      Serial.print("[NetworkComm] Updated MAC for existing peer: ");
+      Serial.println(senderId);
+      break;
+    }
   }
 
-  // Add sender to peer list with minimal logging
-  bool added = addPeer(senderId, senderMac);
+  // If peer doesn't exist, add it
+  if (!peerExists) {
+    addPeer(senderId, senderMac);
+  }
 
   // If we have a discovery callback registered, call it
   if (_discoveryCallback != NULL) {
     _discoveryCallback(senderId);
   }
-
-  // Don't send a response here - let the automatic broadcasting handle
-  // discovery
 }
 
 // Add a peer to our list
@@ -447,6 +495,101 @@ void NetworkComm::processIncomingMessage(const uint8_t* mac,
         const char* messageId = doc["messageId"];
         if (messageId && sender) {
           handleAcknowledgement(sender, messageId);
+        }
+      }
+      break;
+
+    case MSG_TYPE_PIN_READ_REQUEST:
+      // Handle pin read request
+      if (sender && doc.containsKey("pin")) {
+        uint8_t pin = doc["pin"];
+        uint8_t value = 0;
+        bool success = true;
+
+        // Debug logging for pin read request
+        if (_debugLoggingEnabled) {
+          char debugMsg[100];
+          sprintf(debugMsg, "Received pin read request from %s: pin=%d", sender,
+                  pin);
+          debugLog(debugMsg);
+        }
+
+        // Check if message has a messageId for response tracking
+        if (!doc.containsKey("messageId")) {
+          break;  // No message ID, can't respond properly
+        }
+
+        const char* messageId = doc["messageId"];
+
+        // Read the pin value
+        if (_pinReadCallback != NULL) {
+          // Use the custom callback to read the pin
+          value = _pinReadCallback(pin);
+        } else if (pin < NUM_DIGITAL_PINS) {
+          // Default: use digitalRead if pin is valid
+          pinMode(pin, INPUT_PULLUP);  // Set pin to input mode
+          Serial.println("Reading pin");
+          Serial.println(pin);
+          Serial.println(digitalRead(pin));
+          value = digitalRead(pin);
+        } else {
+          // Invalid pin
+          success = false;
+        }
+
+        // Instead of sending immediately, queue the response to be sent in the
+        // update() method This prevents issues with sending from within the
+        // ESP-NOW callback context
+        queuePinReadResponse(sender, pin, value, success, messageId);
+
+        if (_debugLoggingEnabled) {
+          char debugMsg[100];
+          sprintf(debugMsg, "Queued pin read response to %s: pin=%d, value=%d",
+                  sender, pin, value);
+          debugLog(debugMsg);
+        }
+      }
+      break;
+
+    case MSG_TYPE_PIN_READ_RESPONSE:
+      // Handle pin read response
+      if (sender && doc.containsKey("pin") && doc.containsKey("value") &&
+          doc.containsKey("success") && doc.containsKey("messageId")) {
+        uint8_t pin = doc["pin"];
+        uint8_t value = doc["value"];
+        bool success = doc["success"];
+        const char* messageId = doc["messageId"];
+
+        // Debug logging for pin read response
+        if (_debugLoggingEnabled) {
+          char debugMsg[100];
+          sprintf(debugMsg,
+                  "Received pin read response from %s: pin=%d, value=%d, "
+                  "success=%d",
+                  sender, pin, value, success);
+          debugLog(debugMsg);
+        }
+
+        // Find the matching request in the tracked messages
+        for (int i = 0; i < MAX_TRACKED_MESSAGES; i++) {
+          if (_trackedMessages[i].active &&
+              _trackedMessages[i].messageType == MSG_TYPE_PIN_READ_REQUEST &&
+              strcmp(_trackedMessages[i].messageId, messageId) == 0) {
+            // Found the matching request
+
+            // Call the callback as a PinReadResponseCallback (after type
+            // casting back)
+            if (_trackedMessages[i].confirmCallback != NULL) {
+              PinReadResponseCallback callback =
+                  (PinReadResponseCallback)_trackedMessages[i].confirmCallback;
+              callback(sender, pin, value, success);
+            }
+
+            // Mark this message as handled
+            _trackedMessages[i].active = false;
+            _trackedMessages[i].confirmCallback = NULL;
+            break;
+          }
         }
       }
       break;
@@ -624,6 +767,19 @@ bool NetworkComm::sendMessage(const char* targetBoard, uint8_t messageType,
     return false;  // Target board not found
   }
 
+  // Serial.println("Message Size: ");
+  // Serial.println(measureJson(doc));
+  // Print JSON to Serial Console
+  // Serial.println("JSON Output:");
+  // serializeJson(doc, Serial);
+  // Serial.println();  // Newline for better formatting
+
+  // Check if message fits ESP-NOW size limit
+  if (measureJson(doc) + 1 > MAX_ESP_NOW_DATA_SIZE) {
+    Serial.println("[NetworkComm] Error: Message too large");
+    return false;
+  }
+
   // Create outgoing document
   StaticJsonDocument<384> outDoc;
   outDoc.set(doc);  // Copy contents from original doc
@@ -672,9 +828,39 @@ bool NetworkComm::sendMessage(const char* targetBoard, uint8_t messageType,
     return false;
   }
 
+  // Verify the peer exists in ESP-NOW
+  if (esp_now_is_peer_exist(targetMac) == false) {
+    // Re-register peer to ensure up-to-date MAC address
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, targetMac, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+
+    // Remove if exists with different configuration
+    esp_now_del_peer(targetMac);
+
+    // Add with current configuration
+    esp_err_t addResult = esp_now_add_peer(&peerInfo);
+    if (addResult != ESP_OK) {
+      Serial.print("[NetworkComm] Error re-registering peer: ");
+      Serial.println(targetBoard);
+    } else {
+      Serial.print("[NetworkComm] Re-registered peer: ");
+      Serial.println(targetBoard);
+    }
+  }
+
   // Send the message
   esp_err_t result =
       esp_now_send(targetMac, (uint8_t*)jsonStr.c_str(), jsonStr.length() + 1);
+
+  if (result != ESP_OK) {
+    Serial.print("[NetworkComm] ESP-NOW send error to ");
+    Serial.print(targetBoard);
+    Serial.print(": ");
+    Serial.println(result);
+  }
+
   return (result == ESP_OK);
 }
 
@@ -1079,16 +1265,106 @@ bool NetworkComm::clearRemotePinConfirmCallback() {
   return true;
 }
 
-// Get pin value from remote board
-uint8_t NetworkComm::readRemotePin(const char* targetBoardId, uint8_t pin) {
-  // This would need to be implemented with a request/response pattern
+// The new asynchronous implementation
+bool NetworkComm::readRemotePin(const char* targetBoardId, uint8_t pin,
+                                PinReadResponseCallback callback) {
+  if (!_isConnected) return false;
+  if (!callback) return false;  // Callback is required
 
   char debugMsg[100];
   sprintf(debugMsg, "board %s, pin %d", targetBoardId, pin);
   debugLog("Reading remote pin value", debugMsg);
 
-  // For simplicity, we're returning 0
-  return 0;
+  // Prepare the message
+  DynamicJsonDocument doc(64);
+  doc["pin"] = pin;
+
+  // Generate a message ID for tracking
+  char messageId[37];
+  generateMessageId(messageId);
+  doc["messageId"] = messageId;
+
+  // Track this message for callback
+  for (int i = 0; i < MAX_TRACKED_MESSAGES; i++) {
+    if (!_trackedMessages[i].active) {
+      strcpy(_trackedMessages[i].messageId, messageId);
+      strcpy(_trackedMessages[i].targetBoard, targetBoardId);
+      _trackedMessages[i].acknowledged = false;
+      _trackedMessages[i].sentTime = millis();
+      _trackedMessages[i].active = true;
+      _trackedMessages[i].messageType = MSG_TYPE_PIN_READ_REQUEST;
+      _trackedMessages[i].confirmCallback =
+          (PinControlConfirmCallback)callback;  // Type cast for storage
+      _trackedMessages[i].pin = pin;
+      break;
+    }
+  }
+
+  // Send the message
+  return sendMessage(targetBoardId, MSG_TYPE_PIN_READ_REQUEST,
+                     doc.as<JsonObject>());
+}
+
+// Legacy synchronous version for backward compatibility
+uint8_t NetworkComm::readRemotePinSync(const char* targetBoardId, uint8_t pin) {
+  if (!_isConnected) return 0;
+
+  char debugMsg[100];
+  sprintf(debugMsg, "board %s, pin %d (sync)", targetBoardId, pin);
+  debugLog("Reading remote pin value", debugMsg);
+
+  // Static variables to store response data
+  static bool responseReceived = false;
+  static uint8_t pinValue = 0;
+  static bool readSuccess = false;
+
+  // Reset the static variables
+  responseReceived = false;
+  pinValue = 0;
+  readSuccess = false;
+
+  // Static callback function that can be converted to a function pointer
+  static PinReadResponseCallback staticCallback =
+      [](const char* sender, uint8_t respPin, uint8_t value, bool success) {
+        responseReceived = true;
+        pinValue = value;
+        readSuccess = success;
+      };
+
+  // Send the asynchronous request using the existing method
+  bool requestSent = readRemotePin(targetBoardId, pin, staticCallback);
+
+  if (!requestSent) {
+    debugLog("Failed to send pin read request");
+    return 0;
+  }
+
+  // Wait for response with timeout
+  const unsigned long timeout = 5000;  // 5 second timeout
+  unsigned long startTime = millis();
+
+  while (!responseReceived && (millis() - startTime < timeout)) {
+    // Keep processing network updates while we wait
+    update();
+    delay(10);  // Small delay to prevent tight loop
+  }
+
+  if (!responseReceived) {
+    debugLog("Timeout waiting for pin read response");
+    return 0;
+  }
+
+  if (!readSuccess) {
+    debugLog("Pin read reported failure");
+    return 0;
+  }
+
+  // Return the received value
+  char valueMsg[50];
+  sprintf(valueMsg, "Received pin value: %d", pinValue);
+  debugLog(valueMsg);
+
+  return pinValue;
 }
 
 // Accept pin control from a specific board for a specific pin
@@ -1351,4 +1627,117 @@ bool NetworkComm::onBoardDiscovered(DiscoveryCallback callback) {
 
   _discoveryCallback = callback;
   return true;
+}
+
+// Handle pin read requests
+bool NetworkComm::handlePinReadRequests(
+    uint8_t (*pinReadCallback)(uint8_t pin)) {
+  if (!_isConnected) return false;
+
+  if (pinReadCallback == NULL) {
+    debugLog("Setting up automatic pin reading (using digitalRead)");
+  } else {
+    debugLog("Setting up pin reading with custom callback");
+  }
+
+  // Store the callback
+  _pinReadCallback = pinReadCallback;
+
+  return true;
+}
+
+// Stop handling pin read requests
+bool NetworkComm::stopHandlingPinReadRequests() {
+  debugLog("Stopping pin read request handler");
+
+  // Clear the callback
+  _pinReadCallback = NULL;
+
+  return true;
+}
+
+// Queue a pin read response for later processing
+void NetworkComm::queuePinReadResponse(const char* targetBoard, uint8_t pin,
+                                       uint8_t value, bool success,
+                                       const char* messageId) {
+  // Find a free slot in the queue
+  int slot = -1;
+  for (int i = 0; i < MAX_QUEUED_RESPONSES; i++) {
+    if (!_queuedResponses[i].active) {
+      slot = i;
+      break;
+    }
+  }
+
+  // If no free slot, overwrite the oldest response
+  if (slot == -1) {
+    uint32_t oldestTime = UINT32_MAX;
+    for (int i = 0; i < MAX_QUEUED_RESPONSES; i++) {
+      if (_queuedResponses[i].queuedTime < oldestTime) {
+        oldestTime = _queuedResponses[i].queuedTime;
+        slot = i;
+      }
+    }
+  }
+
+  // Store the response
+  strncpy(_queuedResponses[slot].targetBoard, targetBoard,
+          sizeof(_queuedResponses[slot].targetBoard) - 1);
+  _queuedResponses[slot]
+      .targetBoard[sizeof(_queuedResponses[slot].targetBoard) - 1] = '\0';
+
+  strncpy(_queuedResponses[slot].messageId, messageId,
+          sizeof(_queuedResponses[slot].messageId) - 1);
+  _queuedResponses[slot]
+      .messageId[sizeof(_queuedResponses[slot].messageId) - 1] = '\0';
+
+  _queuedResponses[slot].pin = pin;
+  _queuedResponses[slot].value = value;
+  _queuedResponses[slot].success = success;
+  _queuedResponses[slot].queuedTime = millis();
+  _queuedResponses[slot].active = true;
+
+  if (_debugLoggingEnabled) {
+    char debugMsg[100];
+    sprintf(debugMsg,
+            "Queued pin read response to %s: pin=%d, value=%d, msgId=%s",
+            targetBoard, pin, value, messageId);
+    debugLog(debugMsg);
+  }
+}
+
+// Process queued pin read responses
+void NetworkComm::processQueuedResponses() {
+  uint32_t currentTime = millis();
+
+  for (int i = 0; i < MAX_QUEUED_RESPONSES; i++) {
+    if (_queuedResponses[i].active) {
+      // Add a small delay before sending (50ms is usually enough to avoid
+      // ESP-NOW conflicts)
+      if (currentTime - _queuedResponses[i].queuedTime >= 10) {
+        // Create response JSON
+        DynamicJsonDocument response(64);
+        response["pin"] = _queuedResponses[i].pin;
+        response["value"] = _queuedResponses[i].value;
+        response["success"] = _queuedResponses[i].success;
+        response["messageId"] = _queuedResponses[i].messageId;
+
+        if (_debugLoggingEnabled) {
+          char debugMsg[100];
+          sprintf(debugMsg,
+                  "Sending queued pin read response to %s: pin=%d, value=%d",
+                  _queuedResponses[i].targetBoard, _queuedResponses[i].pin,
+                  _queuedResponses[i].value);
+          debugLog(debugMsg);
+        }
+
+        // Send the response
+        sendMessage(_queuedResponses[i].targetBoard, MSG_TYPE_PIN_READ_RESPONSE,
+                    response.as<JsonObject>());
+
+        // Clear this slot
+        _queuedResponses[i].active = false;
+      }
+    }
+  }
 }
