@@ -1,223 +1,182 @@
-#include <Arduino.h>
+/**
+ * BasicDashboard.ino - Example for the WebDashboard library
+ *
+ * This example demonstrates the basic functionality of the WebDashboard
+ * library:
+ * - Setting up a dashboard with a machine state
+ * - Adding controls (buttons)
+ * - Adding settings (toggle, slider, text input, select)
+ * - Adding pin monitoring
+ * - Logging messages and alerts
+ *
+ * Connect to the dashboard using a web browser at the IP address shown in the
+ * serial monitor.
+ */
+
 #include <WebDashboard.h>
 
 // WiFi credentials
 const char* ssid = "YOUR_WIFI_SSID";
 const char* password = "YOUR_WIFI_PASSWORD";
 
-// Create WebDashboard instance
+// Create dashboard instance
 WebDashboard dashboard;
 
 // Pin definitions
-const int LED_PIN = 2;     // Built-in LED on most ESP32 boards
-const int BUTTON_PIN = 0;  // Boot button on most ESP32 boards
+const int LED_PIN = 2;      // Built-in LED on most ESP32 boards
+const int BUTTON_PIN = 0;   // Boot button on most ESP32 boards
+const int ANALOG_PIN = 34;  // Analog input pin (ADC)
 
-// State machine states
-const char* machineStates[] = {"IDLE", "RUNNING", "ERROR", "STANDBY"};
-const int stateCount = 4;
-
-// Variables for demonstration
-int temperature = 25;
-int humidity = 60;
+// Variables for demo
 bool ledState = false;
-bool buttonState = false;
-bool lastButtonState = false;
-unsigned long lastUpdateTime = 0;
-unsigned long lastLedBlinkTime = 0;
-unsigned long lastButtonCheckTime = 0;
-
-// Callback functions
-void onButtonPress(const char* buttonId) {
-  Serial.print("Button pressed: ");
-  Serial.println(buttonId);
-
-  if (strcmp(buttonId, "led_toggle") == 0) {
-    // Toggle LED
-    ledState = !ledState;
-    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
-    dashboard.updateComponent("led_state", ledState ? "ON" : "OFF");
-    dashboard.logf(0, "LED %s by button press",
-                   ledState ? "turned ON" : "turned OFF");
-  } else if (strcmp(buttonId, "alert_test") == 0) {
-    // Test alert
-    dashboard.alert("This is a test alert from button press", 1);
-  }
-}
-
-void onSliderChange(const char* sliderId, int value) {
-  Serial.print("Slider changed: ");
-  Serial.print(sliderId);
-  Serial.print(" = ");
-  Serial.println(value);
-
-  if (strcmp(sliderId, "brightness") == 0) {
-    // Adjust LED brightness if using PWM
-    // For demonstration, we'll just log it
-    dashboard.logf(0, "Brightness set to %d%%", value);
-  }
-}
-
-void onSwitchToggle(const char* switchId, bool state) {
-  Serial.print("Switch toggled: ");
-  Serial.print(switchId);
-  Serial.print(" = ");
-  Serial.println(state ? "ON" : "OFF");
-
-  if (strcmp(switchId, "auto_mode") == 0) {
-    dashboard.logf(0, "Auto mode %s", state ? "enabled" : "disabled");
-  }
-}
-
-void onStateChange(const char* machineId, const char* oldState,
-                   const char* newState) {
-  Serial.printf("State changed: %s from %s to %s\n", machineId, oldState,
-                newState);
-
-  if (strcmp(machineId, "system_state") == 0) {
-    dashboard.logf(0, "System state changed from %s to %s", oldState, newState);
-
-    if (strcmp(newState, "ERROR") == 0) {
-      dashboard.alert("System entered ERROR state!", 2);
-    } else if (strcmp(newState, "RUNNING") == 0) {
-      dashboard.alert("System is now running", 0);
-    }
-  }
-}
+int sliderValue = 50;
+char textValue[64] = "Hello World";
+const char* options[] = {"Option 1", "Option 2", "Option 3", "Option 4"};
+const char* selectedOption = "Option 1";
+unsigned long lastStateChange = 0;
+int stateIndex = 0;
+const char* states[] = {"IDLE", "RUNNING", "PAUSED", "ERROR"};
 
 void setup() {
   // Initialize serial
   Serial.begin(115200);
-  Serial.println("\nInitializing WebDashboard...");
+  Serial.println("WebDashboard Basic Example");
 
-  // Initialize pins
+  // Set pin modes
   pinMode(LED_PIN, OUTPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  digitalWrite(LED_PIN, LOW);
 
-  // Start the dashboard
-  dashboard.enableDebugLogging(true);
+  // Initialize dashboard
   if (dashboard.begin(ssid, password, "ESP32 Dashboard")) {
-    Serial.println("Dashboard started successfully!");
-    Serial.print("Access the dashboard at http://");
+    Serial.print("Dashboard started at http://");
     Serial.println(dashboard.getIPAddress());
   } else {
-    Serial.println("Failed to start dashboard!");
-    while (1) {
-      delay(1000);
-    }
+    Serial.println("Failed to start dashboard");
+    while (1) delay(100);
   }
 
-  // Register dashboard components
+  // Set initial machine state
+  dashboard.setMachineState("IDLE");
+  dashboard.onStateChange(onMachineStateChange);
 
-  // Button components
-  dashboard.registerButton("led_toggle", "Toggle LED", onButtonPress);
-  dashboard.registerButton("alert_test", "Test Alert", onButtonPress);
+  // Add controls
+  dashboard.addButton("btn_led_toggle", "Toggle LED", onLedToggle);
+  dashboard.addButton("btn_log_info", "Log Info", onLogInfo);
+  dashboard.addButton("btn_log_warning", "Log Warning", onLogWarning);
+  dashboard.addButton("btn_log_error", "Log Error", onLogError);
+  dashboard.addButton("btn_next_state", "Next State", onNextState);
 
-  // Switch components
-  dashboard.registerSwitch("auto_mode", "Auto Mode", false, onSwitchToggle);
+  // Add settings
+  dashboard.addToggle("toggle_led", "LED Control", ledState,
+                      onLedToggleFromSettings);
+  dashboard.addSlider("slider_brightness", "Brightness", 0, 255, sliderValue, 1,
+                      onSliderChange);
+  dashboard.addTextInput("text_message", "Message", textValue, onTextChange);
+  dashboard.addSelect("select_option", "Options", options, 4, selectedOption,
+                      onSelectChange);
 
-  // Slider components
-  dashboard.registerSlider("brightness", "Brightness", 0, 100, 50,
-                           onSliderChange);
+  // Add pin monitoring
+  dashboard.addPinMonitor("pin_led", "LED Pin", LED_PIN, OUTPUT, false, 100);
+  dashboard.addPinMonitor("pin_button", "Button Pin", BUTTON_PIN, INPUT_PULLUP,
+                          false, 100);
+  dashboard.addPinMonitor("pin_analog", "Analog Pin", ANALOG_PIN, INPUT, true,
+                          500);
 
-  // Gauge components
-  dashboard.registerGauge("temperature", "Temperature", 0, 50, temperature,
-                          "°C");
-  dashboard.registerGauge("humidity", "Humidity", 0, 100, humidity, "%");
-
-  // Text components
-  dashboard.registerText("led_state", "LED State", ledState ? "ON" : "OFF");
-  dashboard.registerText("button_state", "Button State",
-                         buttonState ? "PRESSED" : "RELEASED");
-
-  // Status component
-  dashboard.registerStatus("system_status", "System Status",
-                           "Normal operation");
-
-  // State machine component
-  dashboard.registerStateMachine("system_state", "System State", machineStates,
-                                 stateCount, "IDLE", onStateChange);
-
-  // Chart component
-  dashboard.registerChart("temp_chart", "Temperature History", "Time",
-                          "Temperature");
-
-  // Log component
-  dashboard.registerLogDisplay("system_log", "System Log");
-
-  // Alert component
-  dashboard.registerAlertDisplay("system_alerts", "System Alerts");
-
-  // Initial log entry
-  dashboard.log("System initialized", 0);
-
-  // Initial alert
-  dashboard.alert("System started successfully", 0);
+  // Log startup message
+  dashboard.log("Dashboard started successfully");
 }
 
 void loop() {
-  // Update the dashboard
+  // Update dashboard
   dashboard.update();
 
-  // Check physical button
-  if (millis() - lastButtonCheckTime > 50) {  // Debounce
-    lastButtonCheckTime = millis();
+  // Read button state and update LED if pressed
+  static bool lastButtonState = HIGH;
+  bool buttonState = digitalRead(BUTTON_PIN);
 
-    bool currentButtonState = !digitalRead(BUTTON_PIN);  // Input is active LOW
-    if (currentButtonState != lastButtonState) {
-      lastButtonState = currentButtonState;
+  if (buttonState == LOW && lastButtonState == HIGH) {
+    // Button pressed
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState);
+    dashboard.updateValue("toggle_led", ledState);
+    dashboard.logf(LOG_INFO, "Button pressed, LED is now %s",
+                   ledState ? "ON" : "OFF");
+  }
+  lastButtonState = buttonState;
 
-      if (currentButtonState) {
-        // Button pressed
-        buttonState = true;
-        dashboard.updateComponent("button_state", "PRESSED");
-        dashboard.log("Physical button pressed", 0);
-      } else {
-        // Button released
-        buttonState = false;
-        dashboard.updateComponent("button_state", "RELEASED");
-      }
+  // Change state every 10 seconds for demo
+  if (millis() - lastStateChange > 10000) {
+    lastStateChange = millis();
+    stateIndex = (stateIndex + 1) % 4;
+    dashboard.setMachineState(states[stateIndex]);
+
+    // Log state change
+    dashboard.logf(LOG_INFO, "Machine state changed to %s", states[stateIndex]);
+
+    // If state is ERROR, send an alert
+    if (strcmp(states[stateIndex], "ERROR") == 0) {
+      dashboard.alert("System entered ERROR state!");
     }
   }
 
-  // Periodically update sensor values (simulated)
-  if (millis() - lastUpdateTime > 2000) {
-    lastUpdateTime = millis();
+  // Small delay to prevent CPU hogging
+  delay(10);
+}
 
-    // Simulate temperature and humidity changes
-    temperature = 20 + random(10);
-    humidity = 50 + random(30);
+// Button callbacks
+void onLedToggle(const char* id) {
+  ledState = !ledState;
+  digitalWrite(LED_PIN, ledState);
+  dashboard.updateValue("toggle_led", ledState);
+  dashboard.logf(LOG_INFO, "LED toggled from button, now %s",
+                 ledState ? "ON" : "OFF");
+}
 
-    // Update gauge components
-    dashboard.updateComponent("temperature", temperature);
-    dashboard.updateComponent("humidity", humidity);
+void onLogInfo(const char* id) {
+  dashboard.log("This is an info message", LOG_INFO);
+}
 
-    // Add data point to chart
-    dashboard.addChartDataPoint("temp_chart", temperature);
+void onLogWarning(const char* id) {
+  dashboard.log("This is a warning message", LOG_WARNING);
+}
 
-    // Log temperature update occasionally
-    if (random(5) == 0) {
-      dashboard.logf(0, "Temperature updated: %d°C", temperature);
-    }
+void onLogError(const char* id) { dashboard.alert("This is an error message"); }
 
-    // Cycle through states for demonstration
-    static int stateIndex = 0;
-    stateIndex = (stateIndex + 1) % stateCount;
-    dashboard.updateState("system_state", machineStates[stateIndex]);
-  }
+void onNextState(const char* id) {
+  stateIndex = (stateIndex + 1) % 4;
+  dashboard.setMachineState(states[stateIndex]);
+  dashboard.logf(LOG_INFO, "Machine state manually changed to %s",
+                 states[stateIndex]);
+}
 
-  // Blink LED in auto mode
-  if (millis() - lastLedBlinkTime > 1000) {
-    lastLedBlinkTime = millis();
+// Settings callbacks
+void onLedToggleFromSettings(const char* id, bool state) {
+  ledState = state;
+  digitalWrite(LED_PIN, ledState);
+  dashboard.logf(LOG_INFO, "LED toggled from settings, now %s",
+                 ledState ? "ON" : "OFF");
+}
 
-    // Check if auto mode is enabled
-    DashboardComponent* autoModeComp = dashboard.findComponent("auto_mode");
-    if (autoModeComp && autoModeComp->data &&
-        (*autoModeComp->data)["value"].as<bool>()) {
-      // Auto mode enabled, blink LED
-      ledState = !ledState;
-      digitalWrite(LED_PIN, ledState ? HIGH : LOW);
-      dashboard.updateComponent("led_state", ledState ? "ON" : "OFF");
-    }
-  }
+void onSliderChange(const char* id, int value) {
+  sliderValue = value;
+
+  // If we had PWM, we could set LED brightness
+  // analogWrite(LED_PIN, value);
+
+  dashboard.logf(LOG_INFO, "Brightness set to %d", value);
+}
+
+void onTextChange(const char* id, const char* value) {
+  strncpy(textValue, value, sizeof(textValue) - 1);
+  dashboard.logf(LOG_INFO, "Message changed to: %s", value);
+}
+
+void onSelectChange(const char* id, const char* value) {
+  selectedOption = value;
+  dashboard.logf(LOG_INFO, "Option changed to: %s", value);
+}
+
+// Machine state change callback
+void onMachineStateChange(const char* oldState, const char* newState) {
+  Serial.printf("Machine state changed from %s to %s\n", oldState, newState);
 }
