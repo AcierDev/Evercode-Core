@@ -48,10 +48,10 @@ PinComm::PinComm() {
   _pinCommInstance = this;
 
   _isConnected = false;
-  _acknowledgementsEnabled = true;
+  _acknowledgementsEnabled = false;
   _debugLoggingEnabled = false;
   _verboseLoggingEnabled = false;
-  _pinControlRetriesEnabled = true;
+  _pinControlRetriesEnabled = false;
   _pinControlMaxRetries = DEFAULT_MAX_RETRIES;
   _pinControlRetryDelay = DEFAULT_RETRY_DELAY;
 

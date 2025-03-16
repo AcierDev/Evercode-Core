@@ -1,0 +1,223 @@
+#include <Arduino.h>
+#include <WebDashboard.h>
+
+// WiFi credentials
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+// Create WebDashboard instance
+WebDashboard dashboard;
+
+// Pin definitions
+const int LED_PIN = 2;     // Built-in LED on most ESP32 boards
+const int BUTTON_PIN = 0;  // Boot button on most ESP32 boards
+
+// State machine states
+const char* machineStates[] = {"IDLE", "RUNNING", "ERROR", "STANDBY"};
+const int stateCount = 4;
+
+// Variables for demonstration
+int temperature = 25;
+int humidity = 60;
+bool ledState = false;
+bool buttonState = false;
+bool lastButtonState = false;
+unsigned long lastUpdateTime = 0;
+unsigned long lastLedBlinkTime = 0;
+unsigned long lastButtonCheckTime = 0;
+
+// Callback functions
+void onButtonPress(const char* buttonId) {
+  Serial.print("Button pressed: ");
+  Serial.println(buttonId);
+
+  if (strcmp(buttonId, "led_toggle") == 0) {
+    // Toggle LED
+    ledState = !ledState;
+    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+    dashboard.updateComponent("led_state", ledState ? "ON" : "OFF");
+    dashboard.logf(0, "LED %s by button press",
+                   ledState ? "turned ON" : "turned OFF");
+  } else if (strcmp(buttonId, "alert_test") == 0) {
+    // Test alert
+    dashboard.alert("This is a test alert from button press", 1);
+  }
+}
+
+void onSliderChange(const char* sliderId, int value) {
+  Serial.print("Slider changed: ");
+  Serial.print(sliderId);
+  Serial.print(" = ");
+  Serial.println(value);
+
+  if (strcmp(sliderId, "brightness") == 0) {
+    // Adjust LED brightness if using PWM
+    // For demonstration, we'll just log it
+    dashboard.logf(0, "Brightness set to %d%%", value);
+  }
+}
+
+void onSwitchToggle(const char* switchId, bool state) {
+  Serial.print("Switch toggled: ");
+  Serial.print(switchId);
+  Serial.print(" = ");
+  Serial.println(state ? "ON" : "OFF");
+
+  if (strcmp(switchId, "auto_mode") == 0) {
+    dashboard.logf(0, "Auto mode %s", state ? "enabled" : "disabled");
+  }
+}
+
+void onStateChange(const char* machineId, const char* oldState,
+                   const char* newState) {
+  Serial.printf("State changed: %s from %s to %s\n", machineId, oldState,
+                newState);
+
+  if (strcmp(machineId, "system_state") == 0) {
+    dashboard.logf(0, "System state changed from %s to %s", oldState, newState);
+
+    if (strcmp(newState, "ERROR") == 0) {
+      dashboard.alert("System entered ERROR state!", 2);
+    } else if (strcmp(newState, "RUNNING") == 0) {
+      dashboard.alert("System is now running", 0);
+    }
+  }
+}
+
+void setup() {
+  // Initialize serial
+  Serial.begin(115200);
+  Serial.println("\nInitializing WebDashboard...");
+
+  // Initialize pins
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  digitalWrite(LED_PIN, LOW);
+
+  // Start the dashboard
+  dashboard.enableDebugLogging(true);
+  if (dashboard.begin(ssid, password, "ESP32 Dashboard")) {
+    Serial.println("Dashboard started successfully!");
+    Serial.print("Access the dashboard at http://");
+    Serial.println(dashboard.getIPAddress());
+  } else {
+    Serial.println("Failed to start dashboard!");
+    while (1) {
+      delay(1000);
+    }
+  }
+
+  // Register dashboard components
+
+  // Button components
+  dashboard.registerButton("led_toggle", "Toggle LED", onButtonPress);
+  dashboard.registerButton("alert_test", "Test Alert", onButtonPress);
+
+  // Switch components
+  dashboard.registerSwitch("auto_mode", "Auto Mode", false, onSwitchToggle);
+
+  // Slider components
+  dashboard.registerSlider("brightness", "Brightness", 0, 100, 50,
+                           onSliderChange);
+
+  // Gauge components
+  dashboard.registerGauge("temperature", "Temperature", 0, 50, temperature,
+                          "°C");
+  dashboard.registerGauge("humidity", "Humidity", 0, 100, humidity, "%");
+
+  // Text components
+  dashboard.registerText("led_state", "LED State", ledState ? "ON" : "OFF");
+  dashboard.registerText("button_state", "Button State",
+                         buttonState ? "PRESSED" : "RELEASED");
+
+  // Status component
+  dashboard.registerStatus("system_status", "System Status",
+                           "Normal operation");
+
+  // State machine component
+  dashboard.registerStateMachine("system_state", "System State", machineStates,
+                                 stateCount, "IDLE", onStateChange);
+
+  // Chart component
+  dashboard.registerChart("temp_chart", "Temperature History", "Time",
+                          "Temperature");
+
+  // Log component
+  dashboard.registerLogDisplay("system_log", "System Log");
+
+  // Alert component
+  dashboard.registerAlertDisplay("system_alerts", "System Alerts");
+
+  // Initial log entry
+  dashboard.log("System initialized", 0);
+
+  // Initial alert
+  dashboard.alert("System started successfully", 0);
+}
+
+void loop() {
+  // Update the dashboard
+  dashboard.update();
+
+  // Check physical button
+  if (millis() - lastButtonCheckTime > 50) {  // Debounce
+    lastButtonCheckTime = millis();
+
+    bool currentButtonState = !digitalRead(BUTTON_PIN);  // Input is active LOW
+    if (currentButtonState != lastButtonState) {
+      lastButtonState = currentButtonState;
+
+      if (currentButtonState) {
+        // Button pressed
+        buttonState = true;
+        dashboard.updateComponent("button_state", "PRESSED");
+        dashboard.log("Physical button pressed", 0);
+      } else {
+        // Button released
+        buttonState = false;
+        dashboard.updateComponent("button_state", "RELEASED");
+      }
+    }
+  }
+
+  // Periodically update sensor values (simulated)
+  if (millis() - lastUpdateTime > 2000) {
+    lastUpdateTime = millis();
+
+    // Simulate temperature and humidity changes
+    temperature = 20 + random(10);
+    humidity = 50 + random(30);
+
+    // Update gauge components
+    dashboard.updateComponent("temperature", temperature);
+    dashboard.updateComponent("humidity", humidity);
+
+    // Add data point to chart
+    dashboard.addChartDataPoint("temp_chart", temperature);
+
+    // Log temperature update occasionally
+    if (random(5) == 0) {
+      dashboard.logf(0, "Temperature updated: %d°C", temperature);
+    }
+
+    // Cycle through states for demonstration
+    static int stateIndex = 0;
+    stateIndex = (stateIndex + 1) % stateCount;
+    dashboard.updateState("system_state", machineStates[stateIndex]);
+  }
+
+  // Blink LED in auto mode
+  if (millis() - lastLedBlinkTime > 1000) {
+    lastLedBlinkTime = millis();
+
+    // Check if auto mode is enabled
+    DashboardComponent* autoModeComp = dashboard.findComponent("auto_mode");
+    if (autoModeComp && autoModeComp->data &&
+        (*autoModeComp->data)["value"].as<bool>()) {
+      // Auto mode enabled, blink LED
+      ledState = !ledState;
+      digitalWrite(LED_PIN, ledState ? HIGH : LOW);
+      dashboard.updateComponent("led_state", ledState ? "ON" : "OFF");
+    }
+  }
+}
